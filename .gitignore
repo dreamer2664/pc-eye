@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+pceye.log
+READY.txt
+cloudflared.exe
+cloudflared
+live/
