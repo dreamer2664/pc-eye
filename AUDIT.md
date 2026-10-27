@@ -1,5 +1,13 @@
 # AUDIT — pc-eye, whole process. Found, fixed, pinned.
 
+> **Numbering, since 2026-10-27:** `F43` and `F44` in this file are *pc-eye* findings (order-dependent test
+> seams; a test that was green only because of that leak). The agency repo's own audit used the same two
+> numbers the same day for its CLI (the unaddressable ballot quorum; a test runner that hid a green file).
+> Both registers are correct where they live and neither can be renumbered — the ids are already in pushed
+> wire messages and commit bodies. So when you cite one, **write the repo in front of it**: `pc-eye F44`,
+> `agency F43`. A new register here should start prefixed (`PCE-45`) if this file keeps growing past the
+> collision. (Agency's ORDERS.md changelog `2026-10-27.2` records the same rule from the other side.)
+
 **Auditor:** vesper · **Base:** `bb68297` (1.0.2 as shipped, "32 tests") · **Result:** 1.0.3, 67 tests
 **Method:** read all 1,214 lines, run it, demonstrate each defect against the *shipped* code before
 fixing it, then re-run the new tests against the old code to prove the tests are not decoration
