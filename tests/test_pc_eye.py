@@ -956,7 +956,14 @@ class FuzzFindings(unittest.TestCase):
         r = subprocess.run([sys.executable, str(HERE / "evidence" / "fuzz_protocol.py"),
                             "--requests", "600", "--seed", "17"], capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env, timeout=240)
-        self.assertEqual(r.returncode, 0, (r.stdout + r.stderr)[-1500:])
+        # Report the SUMMARY, not the tail: the log lines are noise and the important line ("hard failures: N"
+        # plus what they were) scrolls off the end. On the Windows leg this assertion message was the only
+        # evidence available and it was useless — a red that cannot be read is a red that cannot be fixed.
+        keep = [l for l in (r.stdout or "").splitlines()
+                if re.match(r"^(fuzz |status codes|keep-alive|server-side|hard failures|  !|VERDICT)", l.strip())
+                or "Traceback" in l]
+        self.assertEqual(r.returncode, 0, "\n".join(keep[-14:]) or
+                         f"no report lines; stderr: {(r.stderr or '')[-600:]}")
         self.assertIn("hard failures: 0", r.stdout)
         self.assertNotIn(" 500:", r.stdout, "a 500 means an exception escaped the route")
         self.assertIn("server alive after: True", r.stdout)
@@ -972,6 +979,42 @@ class Launcher(unittest.TestCase):
     These are the two failure modes the console could not explain: a port already taken (pc-eye started
     twice, or something else on 8790) and a tunnel binary that arrived as an error page.
     """
+
+    @staticmethod
+    def _reserve_block(count):
+        """Bind `count` adjacent ports and KEEP them bound, for the duration of one test.
+
+        The naive version bound a block, closed it, and then expected the launcher to find `base+count`
+        free. On Windows that loses to the OS every time (`50652 not greater than 50652`, `OSError not
+        raised`): the winsock ephemeral allocator hands the just-released numbers straight back to the next
+        bind. So the busy ports stay busy — held open by this process — and `SO_EXCLUSIVEADDRUSE` (Windows:
+        "no, really") makes the reservation survive even the launcher's own SO_REUSEADDR. On Linux the flag
+        is unsupported and plain binds are already exclusive, so it degrades to exactly what we want.
+        """
+        last = None
+        for _ in range(24):
+            base = free_port()
+            socks = []
+            try:
+                for i in range(count):
+                    sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        sk.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE",
+                                                                  socket.SO_REUSEADDR), 1)
+                    except OSError:
+                        pass
+                    sk.bind(("127.0.0.1", base + i))
+                    sk.listen(1)
+                    socks.append(sk)
+                return base, socks
+            except Exception as e:                      # a neighbour was taken: try another run
+                last = e
+                for sk in socks:
+                    try:
+                        sk.close()
+                    except OSError:
+                        pass
+        raise AssertionError(f"no run of {count} adjacent ports after 24 tries: {last}")
 
     @staticmethod
     def _adjacent_run(count):
@@ -1030,35 +1073,31 @@ class Launcher(unittest.TestCase):
 
     def test_port_collision_moves_and_reports_it(self):
         from launcher import open_socket_on
-        # hold pa AND pa+1: with only pa held, a Windows runner that happens to have pa+1 in a reserved
-        # range makes the launcher move TWO ports and the test reads that as a bug in the launcher.
-        pa, held = self._adjacent_run(2)
-        a, a1 = held[0][0], held[1][0]
+        # Hold pa and pa+1, still held while the launcher tries: the contract is "it moved past the busy
+        # ports and said how far", which cannot be tested by closing them first (Windows reuses the numbers).
+        pa, held = self._reserve_block(2)
         try:
-            b, pb, moved = open_socket_on(pa, tries=4)
+            b, pb, moved = open_socket_on(pa, tries=6)
             try:
-                # The contract is "it moved, it stayed inside the window, and it counted the hops" — not
-                # "the next port was free", which is the OS's business. An earlier version asserted pa+1
-                # exactly and went red whenever a stray process (mine, from a killed run) held that port.
-                self.assertGreater(pb, pa, "a busy port must move UP, never down")
-                self.assertLessEqual(pb - pa, 3, "it must stay inside the tries window it was given")
+                self.assertGreater(pb, pa + 1, f"a busy block must be skipped entirely, landed on {pb}")
+                self.assertLessEqual(pb - pa, 5, "it must stay inside the tries window it was given")
                 self.assertEqual(moved, pb - pa, "the number it reports must be the number of hops taken")
             finally:
                 b.close()
         finally:
-            for sk in (a, a1):
+            for sk in held:
                 sk.close()
 
     def test_port_exhaustion_is_an_explanation(self):
         from launcher import open_socket_on
-        base, held = self._adjacent_run(3)      # proven adjacent, proven busy, and 4th was released
+        base, held = self._reserve_block(3)      # held for the whole test: "busy" must be true, not recent
         try:
             with self.assertRaises(OSError) as e:
                 open_socket_on(base, tries=3)
             self.assertIn("another pc-eye", str(e.exception))
         finally:
-            for s_, _, _ in held:
-                s_.close()
+            for sk in held:
+                sk.close()
 
     def test_a_bogus_tunnel_download_is_refused_before_it_is_executed(self):
         """The download is HTTPS from GitHub with no signature check, so the least we can do is refuse to
