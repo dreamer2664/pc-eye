@@ -187,3 +187,21 @@ First live run on CarloPC. Found and fixed the DPI coordinate split (capture 192
   still fails loudly if a pass is removed.
 - Rule recorded: a test may not re-run the suite; anything that needs a whole run's outcome is a gate step, and a
   gate step may not be a test inside the run it gates.
+## Unreleased — 2026-10-27 (vesper): three ways a check can pass without checking (F53, F54, F55)
+
+- **F53** `tests/run_all.py::report` capped each failure block at 14 lines, which cut the harness's
+  `hard failures: N` verdict out of the only red that mattered; the head of a block is kept *plus* every line
+  stating a verdict or a count.
+- **F54** `evidence/fuzz_protocol.py` classified by exception *type*, so a client-side timeout was reported as a
+  crash without the control question (`still_alive()`) ever being asked; the other passes in CI also ran the soak
+  three times a job. Now: classify by what the exception is about, ask the control question patiently, let one
+  pass per job own the soak, and keep latency where it belongs (BENCH). No invariant loosened.
+- **F55** `tools/check_docs.py` verified README's test count only when it found the phrase
+  `"<N> tests, headless-safe"` — rewording the sentence switched the check off, and it reported "docs in sync"
+  with README two commits stale. Every `N tests` claim in README must now match the suite; a test pins that a
+  reworded README cannot escape it, that a path (`python3 tests/run_all.py`) is not a count, and that prose
+  without a number is not an error.
+- **F55 second half**: the count itself was a grep for `def test_`, which counted a fixture string in the test
+  added to fix the first half (86 vs the 85 collected). `check_docs.suite_count()` now asks `unittest` for
+  `countTestCases()` — the number the runner will run — with an AST fallback and a floor assertion so an empty
+  result cannot pass.

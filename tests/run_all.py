@@ -55,7 +55,15 @@ def report(out, full=False):
         blocks = re.split(r"\n(?=(?:FAIL|ERROR)(?:\d+)?: )", out)
         for b in blocks:
             if re.match(r"^(FAIL|ERROR)(?:\d+)?: ", b):
-                keep.append("\n".join(b.rstrip().splitlines()[:14]))
+                # F53: the 14-line cap was written for hand-written unittest blocks, and on CI it cut the
+                # harness's `hard failures: N` summary out of the only failing block — I read a red whose cause
+                # had been truncated away, in the file whose docstring says a red that cannot be read cannot be
+                # fixed. Keep the head of the block, then any line that states a verdict or a count.
+                bl = b.rstrip().splitlines()
+                extra = [l for l in bl[14:]
+                         if re.search(r"hard failures:|VERDICT|status codes:|server alive after|races \(|"
+                                      r"failures=|errors=|Ran ", l)]
+                keep.append("\n".join(bl[:14] + extra[:14]))
     else:                                   # no failure names: show everything, something is wrong
         keep = ["\n".join(lines[-12:])]
     summary = [l for l in lines if re.match(r"^(Ran |OK|FAILED|SKIPPED|VERDICT|\d+/\d+)", l.strip())]

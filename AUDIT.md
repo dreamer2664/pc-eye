@@ -693,3 +693,93 @@ available as a *command* (`python3 tests/run_ordered.py`), where it belongs: run
 
 The rule for anyone writing a gate from now on: a test may not re-run the suite. If a check needs the whole run's
 outcome, it is a gate step, and a gate step must not also be a test inside the run it gates.
+
+### F53 · LOW · the failure reporter truncated the line that explained the failure
+
+*Found:* 2026-10-27 15:40Z (vesper), reading `windows-latest, 3.13` at `1f082f6`. *Status:* fixed in
+`tests/run_all.py::report`.
+
+`report()` keeps the first 14 lines of each FAIL block — a limit I wrote so a Windows leg with 33 tracebacks
+would not flood the log. On this red the informative part was *below* line 14: the fuzz harness prints its counts
+and `hard failures: N` after the per-request noise, so CI showed me a failing assertion, a status-code line, and
+no verdict — the one thing I needed to classify it. The file's own docstring already says "a red that cannot be
+read is a red that cannot be fixed"; the cap contradicted it. Fixed by keeping the head of the block **plus** any
+line anywhere in it that states a verdict or a count (`hard failures:`, `VERDICT`, `Ran `, `failures=`…). Pinned
+by the shape of the report, not by a fixture: this is a formatting rule about other people's output.
+
+### F54 · MED · the fuzz harness called a slow runner a crash, and my own gate change is what made it slow
+
+*Found:* same log. *Status:* fixed in `evidence/fuzz_protocol.py`.
+
+`hard` is the list of protocol violations that make the harness exit 1, and the harness has a control question —
+`still_alive()` — for exactly this judgement (F36: a closed socket looks like a dead PC). But the exception
+handling was split by **type**: `RemoteDisconnected/ConnectionResetError/BadStatusLine` asked the question and
+counted a soft race; *everything else* went straight into `hard` unexamined. A client-side `TimeoutError` — what
+a loaded runner produces when 600 requests hit a busy box — is therefore reported as "crash", without the server
+ever being asked whether it is alive. The message in CI was the giveaway: `server alive after: True`, and the
+only hard item was a timeout.
+
+Two things made it fire now rather than never: F52's guard ran the whole suite inside a test method, and my
+ordered + isolated passes run the suite three times per job. So the soak — the heavy, timing-sensitive step — was
+executed three times under rising contention. Fixed on all three axes, none of them "make the test laxer":
+classification is by what the exception is *about* (`transport(e)`) with the control question applied to all of
+them; `still_alive()` asks patiently twice (15s, 30s) because its answer decides whether a human is told their
+PC died; and the ordered/isolated passes set `PCEYE_SKIP_SOAK=1` so exactly one pass per job owns the soak.
+`REQ_TIMEOUT` went 8 → 20s because this harness measures *honesty*, not latency — `evidence/BENCH_*.json` is the
+latency instrument, and one file may not quietly become the other. Nothing about the invariant loosened: a
+non-JSON body, a 500, or a server that truly stops answering is still hard, and `server alive after: False`
+still fails the run.
+
+### F55 · MED · a doc check conditional on a magic phrase is a doc check that prose can switch off
+
+*Found:* 2026-10-27 15:45Z (vesper), while editing README for F52 — and it is the most transferable thing in this
+file after F43. *Status:* fixed in `tools/check_docs.py`, with `ZSeamIntegrity` pinning it.
+
+The F42-era rule was:
+
+    declared = re.findall(r"(\d+) tests, headless-safe", readme)
+    if declared and int(declared[0]) != tests: fail(...)
+
+Note the `if declared`. I reworded the README line — `# 82 tests, three orders: CI's, source, and each class
+alone` — and the pattern stopped matching, so the checker reported **"docs in sync"** while README was stating a
+number two out of date. It found 84 and README said 82, and said nothing. A check whose *premise* is a sentence
+in the document it audits is not a check; it is a courtesy. My own docs edit disabled my own gate, silently, and
+green, one hour after I wrote the gate.
+
+Fixed by making no count in README special: every `N tests` the file claims must equal the suite's count, so
+rewording cannot escape it (and the check still says nothing about prose that declines to state a number —
+enforcing a count in every sentence would just train people to delete the sentence). The first run of the new
+rule caught drift immediately, which is the evidence it was needed: `README advertises 84 tests; the suite
+defines 86`. Two guards came with it, both learned the hard way today: `python3 tests/run_all.py` must not be
+read as a claim of "3 tests" (a path is not a count; a lookbehind and a punctuation guard keep filenames out of
+the arithmetic), and the new test asserts on the *count line* rather than on `main()`'s exit code, because the
+scratch tree has no refusal table and a test that fails for unrelated reasons is a test nobody will trust.
+
+The general form, for whoever audits the next repo: **look for `if found:` in front of every assertion.** A rule
+that only applies when the input happens to be shaped the way the rule's author guessed is a rule that the input
+can veto. Same root as F49 (a green file that reported no count) and F45 (read back the newest message, not
+mine): the check must be unable to pass by finding nothing.
+
+#### F55, second half: the count was a grep, and a grep counts the wrong thing
+
+Tightening the rule surfaced the next layer, in the same hour: the *number* the rule compares against was
+`len(re.findall(r"def test_", suite_source))`, and a fixture in the test I had just added contains the literal
+text `def test_a()`. The grep counted it. README was failed for **86** against the **85** the runner collects —
+i.e. the check was right that something was inconsistent, and wrong about which side. A count taken from a text
+pattern counts the pattern.
+
+`tools/check_docs.py` now has `suite_count()`: import the module and ask `unittest` for `countTestCases()`, and
+only if that raises fall back to an AST walk over `TestCase` classes — a structural count, never a substring
+search. `ZSeamIntegrity.test_the_count_is_the_collected_suite_not_a_grep` pins equality with what the loader
+collects, plus `assertGreater(n, 60)` so "found nothing" cannot masquerade as agreement (the F49/F55 shape again:
+a check that is satisfied by an empty result is not a check), and `assertLessEqual(n, grep)` to record that the
+file text can only over-count.
+
+Worth stating plainly because it is the useful part: F55 took three tries to fix, and each try was a *new* bug —
+the phrasing dependence, then a path (`python3 tests/…`) read as a claim of "3 tests", then the grep/collect
+split — and the last two were caught only by running the checker for real after each edit. If a fix needs three
+rounds, the lesson is not that I should have been more careful the first time; it is that a rule about text has to
+be executed against the text it will meet, which is what `tests/run_all.py` and the pytest legs are for. (Also
+mine, same hour: a splice renamed `def main()` to `def count()` and left the module with no entry point —
+`NameError: name 'main' is not defined` — caught by running `python3 tools/check_docs.py` instead of trusting
+that an `ast.parse` of my own patch was enough. Parsing proves shape, not behaviour.)

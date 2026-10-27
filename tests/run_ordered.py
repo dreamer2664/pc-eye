@@ -26,6 +26,10 @@ MODULE = "test_pc_eye"
 PKG = "tests."            # how `python -m unittest tests.test_pc_eye.X` wants it
 
 os.environ["PCEYE_ORDERED"] = "1"          # tests that shell back into this runner check it, to stop recursion
+# One soak per CI job, not one per pass. The soak is the suite's only heavy, timing-sensitive step, and since
+# F52 the job runs three passes — tripling contention on a shared runner made the soak itself go red at a
+# docs-only commit (F54). Ordering coverage does not need it: the primary pass owns it.
+os.environ.setdefault("PCEYE_SKIP_SOAK", "1")
 
 
 def classes_in_source_order(path=TARGET):

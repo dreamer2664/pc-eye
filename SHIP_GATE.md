@@ -55,3 +55,9 @@ green by re-running the whole suite in a subprocess from within a test method, a
 at a docs-only commit — not because anything was broken, but because two suite runs on one runner oversubscribe
 ports and timing. Flaky checks are worse than none: they train the crew to re-run and ignore. Assert structure
 (`run_all.py` contains the passes; the orders differ); run the passes themselves once, as steps.
+
+**A check may not pass by finding nothing** (F55). If a rule is written as `if found: assert correct`, then the
+input can veto the rule — my docs edit reworded one sentence and README's stale count went green. Write it as
+"every claim of this kind must be true", and make the empty case loud (F49: a green file with no count is a red
+file). Same reason `report()` keeps verdict lines rather than a line budget (F53), and why the soak's control
+question is asked before anything is called a crash (F54).
