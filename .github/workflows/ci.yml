@@ -54,7 +54,10 @@ jobs:
           python server.py --version
           python launcher.py --help
 
-      - name: Selftest on this box (a red here is honest, not a fake green)
+      # No --port here: --selftest asks a question about the machine and must never need a socket. The
+      # capture/platform rows WILL go red on the headless runner image (no desktop session), and that is
+      # the honest answer — so continue-on-error, but the step's output is kept and read by a human.
+      - name: Selftest on this box (a red capture row on a headless runner is expected, not a fake green)
         continue-on-error: true
         run: |
-          python server.py --selftest --dry-run --port 8799
+          python server.py --selftest --dry-run

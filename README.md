@@ -92,7 +92,7 @@ test box — a save-to-disk mode, not a browsing mode.
 
 ```
 python tests/run_all.py                       # the suite, and what CI runs
-python -m unittest discover -s tests          # 67 tests, headless-safe
+python -m unittest discover -s tests          # 77 tests, headless-safe
 python evidence/bench.py --no-limit           # timings (needs a display for capture-side numbers)
 python evidence/capture_count.py              # pixel work per request, old tree vs new
 python evidence/negative_check.py             # proves the regression tests fail on 1.0.2
@@ -120,3 +120,19 @@ on every action are what tell you that, on the machine itself.
 * **Elevated windows (UAC / admin apps) will not take the input**, and their pixels may come back black.
 * One machine, one screen. Multi-monitor is captured as one wide surface.
 * If the PC sleeps or you close the console window, requests fail. That is your switch, and it is deliberate.
+
+## How the protocol was tested, and why there is a fuzzer in `evidence/`
+
+`tests/test_pc_eye.py` (77 tests) is the contract. `evidence/fuzz_protocol.py` is the generator that found
+six more bugs the contract did not describe — four of them in code written during the 1.0.3 audit itself,
+including `/shot?fmt=png&quality=50` raising `UnboundLocalError` inside the handler. Two properties it
+checks that a hand-written list never would: **the server always answers** (a bad argument is a 400 with a
+sentence, never a closed socket — an agent cannot tell a dead PC from a typo), and **the server prints no
+traceback** (a human's console full of fake bugs is how a real one gets ignored).
+
+    python3 evidence/fuzz_protocol.py --requests 4000        # ~3s, no display, no mouse, --dry-run
+
+`python3 tests/run_all.py --all` runs the suite, `tools/check_docs.py` (docs may not drift from the code),
+the capture counter, and the negative control — which hosts these very tests against the pre-fix `server.py`
+and reports how many go red **without** the fix (38 run, 35 red). A suite that only passes on the new code
+proves nothing; that ratio is the proof. A green gate is still not proof that a click landed.

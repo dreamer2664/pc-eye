@@ -6,6 +6,7 @@ human's mouse is exactly the code that should not be merged on feel.
 
 $ python3 tools/check_docs.py
 $ python3 tests/run_all.py --all
+$ python3 evidence/fuzz_protocol.py --requests 20000 --seed 7
 
 ## What a green gate does NOT prove — say this out loud, do not paper over it
 
@@ -17,5 +18,8 @@ $ python3 tests/run_all.py --all
 * capture-side speed is **counted** (`evidence/capture_count.py`), not timed, on a headless box: a sandbox
   with no display cannot honestly measure a screen grab, and pretending otherwise is the failure mode
   this repo keeps paying for.
+* `evidence/FUZZ.txt` is the 200,000-request record behind F27–F33. The generator's invariant is not "the
+  right status code" but "**an answer, in JSON, always**": every bug it found was a closed socket, which is
+  what a dead PC looks like to an agent. Add a route or a parameter and the generator covers it for free.
 * `evidence/negative_check.py` is the check that the suite is not decoration: it runs the new tests
   against the pre-fix tree and reports how many fail. If that number is 0, the tests prove nothing.

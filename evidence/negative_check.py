@@ -6,6 +6,7 @@ and writes the verdict into evidence/ so the claim "61 tests pin the flaws" is v
 asserted. It runs from a scratch copy so it never touches the working tree.
 """
 import importlib.util
+import os
 import pathlib
 import shutil
 import sys
@@ -32,14 +33,16 @@ def main() -> int:
     # the harness pins its own repo onto sys.path; without this the "old" run would import the NEW
     # server from the working tree and prove nothing at all.
     head = head.replace(f'sys.path.insert(0, str(HERE))', 'sys.path.insert(0, str(pathlib.Path(__file__).parent))')
-    reg = "class RegressionV103" + test_src.split("class RegressionV103")[1].split('if __name__')[0]
+    reg = "class RegressionV103" + test_src.split("class RegressionV103")[1].split("class FuzzFindings")[0]
+    fz = ("class FuzzFindings" + test_src.split("class FuzzFindings")[1].split("class Launcher")[0]
+          if "class FuzzFindings" in test_src else "")
 
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="pceye-neg-"))
     try:
         if not extract_old_server(tmp):
             _oldtree.skip("the negative control")
             return 0
-        (tmp / "test_reg.py").write_text(head + "\n\n" + reg)
+        (tmp / "test_reg.py").write_text(head + "\n\n" + reg + "\n\n" + fz)
         spec = importlib.util.spec_from_file_location("test_reg", str(tmp / "test_reg.py"))
         mod = importlib.util.module_from_spec(spec)
         sys.path.insert(0, str(tmp))
@@ -54,8 +57,13 @@ def main() -> int:
         real_out, real_err = sys.stdout, sys.stderr
         sys.stdout = sys.stderr = buf
         try:
-            res = unittest.TextTestRunner(stream=buf, verbosity=0).run(
-                unittest.defaultTestLoader.loadTestsFromTestCase(mod.RegressionV103))
+            suite = unittest.TestSuite()
+            for cname in ("RegressionV103", "FuzzFindings"):
+                klass = getattr(mod, cname, None)
+                if klass is not None:
+                    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(klass))
+            os.environ["PCEYE_SKIP_SOAK"] = "1"     # the soak spawns its own server; wrong tree here
+            res = unittest.TextTestRunner(stream=buf, verbosity=0).run(suite)
         finally:
             sys.stdout, sys.stderr = real_out, real_err
         buf.close()
