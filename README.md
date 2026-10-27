@@ -121,13 +121,15 @@ on every action are what tell you that, on the machine itself.
 * One machine, one screen. Multi-monitor is captured as one wide surface.
 * If the PC sleeps or you close the console window, requests fail. That is your switch, and it is deliberate.
 
-## Editing this repo: two mechanical rules (AUDIT.md F39)
+## Editing this repo: three mechanical rules (AUDIT.md F39, F42)
 
 Commit messages go through `git commit -F - <<'MSG'` (quoted delimiter). In a double-quoted `git commit -m`
 the shell runs backticks first: mine deleted its own evidence, created a stray file, and aborted the
 `git checkout -b` that preceded it — which is how a commit landed on `main`. And a `git merge` inside an `&&`
 chain can print "MERGED" while main does not move, so merges are one call and the proof
-(`rev-parse main`, `merge-base --is-ancestor`) is the next.
+(`rev-parse main`, `merge-base --is-ancestor`) is the next. Third: every `open`/`read_text`/`write_text`
+names `encoding="utf-8"`, because the CI legs include Windows and its default codec cannot read this repo.
+All three are checked by a machine (`tools/check_docs.py`, plus the pre-commit hook), not by memory.
 
 ## How the protocol was tested, and why there is a fuzzer in `evidence/`
 

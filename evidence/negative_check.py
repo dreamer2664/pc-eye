@@ -28,7 +28,7 @@ def extract_old_server(dest: pathlib.Path) -> bool:
 
 
 def main() -> int:
-    test_src = (REPO / "tests" / "test_pc_eye.py").read_text()
+    test_src = (REPO / "tests" / "test_pc_eye.py").read_text(encoding="utf-8")
     head = test_src.split("class Protocol")[0]
     # the harness pins its own repo onto sys.path; without this the "old" run would import the NEW
     # server from the working tree and prove nothing at all.
@@ -42,7 +42,8 @@ def main() -> int:
         if not extract_old_server(tmp):
             _oldtree.skip("the negative control")
             return 0
-        (tmp / "test_reg.py").write_text(head + "\n\n" + reg + "\n\n" + fz)
+        (tmp / "test_reg.py").write_text(head + "\n\n" + reg + "\n\n" + fz,
+                                  encoding="utf-8")
         spec = importlib.util.spec_from_file_location("test_reg", str(tmp / "test_reg.py"))
         mod = importlib.util.module_from_spec(spec)
         sys.path.insert(0, str(tmp))

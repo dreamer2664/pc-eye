@@ -38,6 +38,15 @@ Two of the fixes introduced their own bug and were caught by the same machinery 
 a finiteness guard that called `float()` on a huge int, and a whole-number test that compared a value with
 its own truncation. Suite 67 → 77; the negative control now runs 38 tests against 1.0.2 and 35 go red.
 
+### F42 — textual I/O in this repo must name its encoding (`tools/check_docs.py` enforces it)
+
+Windows' default codec is cp1252, and `server.py` contains em-dashes by design. Tests that read the product's
+own source, and `evidence/negative_check.py` writing it into a tmp file, were therefore green on Linux and
+`UnicodeDecodeError`/`UnicodeEncodeError` on the windows-latest leg. Fixed the eight call sites; added an
+`ast`-based gate in `tools/check_docs.py` that fails the build on any `read_text`/`write_text`/`open` of a text
+file with no `encoding=`, shipped with a negative control (2/2 caught, 4/4 deliberately skipped) because a
+check that cries wolf gets ignored — the first draft, written as a character-scanning regex, did exactly that.
+
 ### F41 — the response guard guarded the wrong write (Windows-only, found by the CI leg)
 
 `_write()` protected the body write, which is the only place Linux reports a vanished peer; on Windows the

@@ -15,11 +15,76 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVED = {"/state", "/shot", "/act", "/selftest", "/favicon.ico", "/"}
 REFUSALS = ("400", "401", "403", "409", "413", "415", "429", "503")
+# Things a text-encoding gate must keep its nose out of: reading a screenshot, a binary, or a
+# blob in "rb" is correct code, and flagging it would train everyone to ignore this file.
+BINARY_HINTS = ("rb", "wb", "ab", "buffering=0", ".bin", ".png", ".jpg", ".ico", ".exe", ".zip")
 
 
 def read(name):
     with open(os.path.join(ROOT, name), encoding="utf-8") as f:
         return f.read()
+
+
+def check_encodings(root):
+    """F42: every text read/write in this repo must name its encoding. Found by the windows-latest leg.
+
+    Windows' default text encoding is cp1252; `server.py` contains em-dashes and arrows because a refusal has
+    to read like an operator's sentence rather than a stack frame. A test doing `Path(pceye.__file__).
+    read_text()` therefore explodes there with UnicodeDecodeError while being perfectly green on Linux — the
+    mirror image of F37, and the fourth time a "works here" assumption about bytes-vs-text cost a red leg.
+
+    Written as an AST walk, not a regex: my first attempt scanned characters to find the end of each call and
+    had an off-by-one that reported `(e` as the arguments, flagging the *fixed* lines and missing nothing —
+    which is exactly how a gate loses its authority. `ast` cannot get the syntax wrong, and the line it
+    reports is a real line.
+    """
+    import ast
+    bad = []
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "__pycache__", "node_modules", ".venv")]
+        for fn in sorted(files):
+            if not fn.endswith(".py") or fn == "oldtree.py":
+                continue
+            f = os.path.join(dirpath, fn)
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                src = fh.read()
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue                       # the suite reports a file that does not parse; do not pile on
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = getattr(func, "attr", None) or getattr(func, "id", None)
+                if name not in ("read_text", "write_text", "open"):
+                    continue
+                kws = {k.arg for k in node.keywords}
+                if kws & {"encoding", "errors", "mode"}:
+                    continue
+                if name in ("read_text", "write_text"):
+                    # Path(x).read_text() on a source/doc path always names the file inside the call chain, so
+                    # the whole statement's source line is the right thing to inspect.
+                    line = src.splitlines()[node.lineno - 1]
+                    if any(t in line for t in BINARY_HINTS):
+                        continue
+                    if not re.search(r"__file__|HERE|REPO|ROOT|\bPath\(|\.read_text|\.write_text", line):
+                        continue
+                    rel = os.path.relpath(f, root).replace(os.sep, "/")
+                    bad.append(f"{rel}:{node.lineno}: {name}() with no encoding= — on Windows the cp1252 "
+                               f"default mangles or rejects this file's em-dashes")
+                    continue
+                # open(): first two positional args may hold mode/encoding as literals; keywords covered above
+                rendered = ast.unparse(ast.Expression(list(node.args[:2]))) if node.args else ""
+                if any(t in rendered for t in BINARY_HINTS):
+                    continue
+                if not re.search(r"__file__|HERE|REPO|ROOT|\bPath\(|\.(md|txt|json|yml|yaml|toml|cfg|ini|sh)\b",
+                                 rendered):
+                    continue
+                rel = os.path.relpath(f, root).replace(os.sep, "/")
+                bad.append(f"{rel}:{node.lineno}: open() on a text file with no encoding= — pass it explicitly "
+                           f"(Windows' default is cp1252): {rendered[:60]}")
+    return bad
 
 
 def main() -> int:
@@ -66,6 +131,7 @@ def main() -> int:
             fails.append(f"tests hardcode port {bad} — an OS-assigned port or nothing "
                          f"(Windows CI reserves whole ranges; a fixed port is a flake waiting to happen)")
 
+    fails += check_encodings(ROOT)      # platform-blindness gate: F42 may not be re-introduced by editing
     if fails:
         print("DOC DRIFT:")
         for f in fails:

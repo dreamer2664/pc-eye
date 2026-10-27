@@ -25,7 +25,7 @@ def ensure(tag="base"):
                        capture_output=True, text=True)
     if r.returncode != 0:
         return None
-    (dest / "server.py").write_text(r.stdout)
+    (dest / "server.py").write_text(r.stdout, encoding="utf-8")
     return dest
 
 
