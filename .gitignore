@@ -1,7 +1,5 @@
-__pycache__/
+# scratch: patch scripts belong in /tmp (see agency F34 — `git add -A` will sweep whatever is lying around)
+tools/_p*.py
+tools/_patch*.py
+**/__pycache__/
 *.pyc
-pceye.log
-READY.txt
-cloudflared.exe
-cloudflared
-live/
