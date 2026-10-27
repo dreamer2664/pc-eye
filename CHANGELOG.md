@@ -38,6 +38,17 @@ Two of the fixes introduced their own bug and were caught by the same machinery 
 a finiteness guard that called `float()` on a huge int, and a whole-number test that compared a value with
 its own truncation. Suite 67 → 77; the negative control now runs 38 tests against 1.0.2 and 35 go red.
 
+### F41 — the response guard guarded the wrong write (Windows-only, found by the CI leg)
+
+`_write()` protected the body write, which is the only place Linux reports a vanished peer; on Windows the
+abort arrives from the header flush as `ConnectionAbortedError`/winsock 10053, and a refusal like the 403
+cross-origin has no body to guard. All responses now go through one funnel, `_respond()`, whose swallow test
+is `Handler._peer_vanished(e)` — named connection errors ∪ an errno list that includes the winsock codes, and
+nothing else (a full disk must stay loud). The fix's own two bugs are recorded in `AUDIT.md` so they read as
+reasons rather than superstition: `except (self.PEER_GONE, OSError)` is a runtime error, not a syntax one, and
+closing `wfile` inside the guard produced a fresh `ValueError` on the stdlib's own final flush. Suite 77 → 79;
+the fuzz oracle was widened at the same time (it had been blind to bare `TypeError`/`NameError` lines).
+
 ### Two process fixes, because the process is part of the product (F39–F40)
 
 `AUDIT.md` now records that three separate losses this shift came from *quoting*, not logic — a YAML colon

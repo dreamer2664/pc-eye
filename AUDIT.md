@@ -495,3 +495,49 @@ to remember is a rule that will be broken under load.** So the rule moved from m
 The second-order lesson, for whoever writes the next gate: if a check can be forgotten, it is not a check.
 Put it in a hook, a CI step, or `tools/check_docs.py` — the three places on this repo that have actually
 caught me.
+---
+
+## F41 — HIGH (Windows-only, invisible on Linux by construction) · the response guard guarded the wrong write
+
+`_write()` protected `wfile.write(body)`. That is the only place **Linux** can tell you the peer is gone, so
+every test on this box was green. On the windows-latest leg the soak printed 33 tracebacks and every one of
+them pointed at the *cross-origin refusal* — a response with **no body at all**:
+
+    File "server.py", line 848, in _json
+        self.send_header("X-Content-Type-Options", "nosniff")
+    ValueError / ConnectionAbortedError, raised from the flush inside end_headers()
+
+Two platform facts, neither of which is documented in the Python stdlib where you would look:
+
+1. HTTP response headers are **buffered**; the syscall happens in `end_headers()`/`flush()`, not in
+   `wfile.write(body)`. So a guard around the body write protects nothing on a header-only response.
+2. A peer that aborted during that flush raises `ConnectionAbortedError` with winsock code **10053
+   (WSAECONNABORTED)** on Windows, and 10053 is *not* a subclass of `ConnectionResetError` the way Linux's
+   `EPIPE`/`ECONNRESET` behaviour leads you to expect. Catching the named connection exceptions is therefore
+   not enough on the platform that matters.
+
+Fix, in that order:
+* one funnel, `_respond(code, headers, body)`, used by `_json` **and** `_bytes`; it wraps the *entire*
+  response — status line, header block, flush, body — because that whole sequence can die.
+* the swallow test is `Handler._peer_vanished(e)`: the named connection exceptions, **or** an `OSError` whose
+  errno is in `PEER_ERRNOS` (POSIX names ∪ the winsock codes 10053/10054/10058/10060, listed explicitly
+  because `errno` has no name for them on Linux). Everything else re-raises: a full disk (`ENOSPC`), a bad
+  fd, or a bug in a custom stream must stay loud. `except OSError: pass` would have "fixed" the red and
+  destroyed the operator's only signal of an outage.
+* do **not** close `self.wfile` when the peer vanishes. My first attempt did, and `handle_one_request()` ends
+  with `self.wfile.flush()` → `ValueError: I/O operation on closed file` — a new traceback, printed for the
+  non-event I was silencing. The stream is replaced with an inert suppressor instead.
+
+Two meta-findings, because they are the useful part:
+
+* **A second-order bug in the fix itself.** `except (self.PEER_GONE, OSError)` looks like a union of a tuple
+  and a class; Python rejects it only at *runtime*, on the first request that trips it
+  (`TypeError: catching classes that do not inherit from BaseException`). A syntax check, an import, and the
+  whole suite on Linux all stayed green until a real aborted client arrived. Now pinned by a test that aborts
+  a socket mid-headers on three routes, and by a direct unit test of `_peer_vanished` that asserts ENOSPC is
+  **not** peer-gone.
+* **The fuzzer's own oracle had a hole** — its exception regex missed bare `TypeError`/`NameError` lines, so
+  it reported `tracebacks: 33` while showing me nothing. The matcher now enumerates the suffixes
+  (`Error|Exception|Interrupt|Exit|Warning|Failure`), which is what immediately surfaced
+  `NameError: name 'self' is not defined` on the next run. An oracle that cannot see a class of failure is
+  worse than no oracle: it makes the silence look audited.

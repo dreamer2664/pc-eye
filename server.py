@@ -42,6 +42,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import ssl
+import errno
 import hmac
 import io
 import json
@@ -837,43 +839,83 @@ class Handler(BaseHTTPRequestHandler):
             o = ""
         return bool(o) and o == host
 
-    def _json(self, code, obj):
-        body = json.dumps(obj, sort_keys=True, default=str).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self._write(body)
+    # What "the other end is gone" looks like, on both platforms (F41). Listed rather than blanket-caught so
+    # that a traceback which DOES appear still means a bug in the product.
+    PEER_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, ssl.SSLError)
+    PEER_ERRNOS = frozenset(filter(None, (
+        getattr(errno, n, None) for n in
+        ("EPIPE", "ESHUTDOWN", "ENOTCONN", "ECONNRESET", "ECONNABORTED", "ECONNREFUSED")))) | {
+        # winsock codes, spelled out because `errno` has no name for them on Linux and the Windows ones are
+        # what this whole guard exists for: 10053 = connection aborted by the software (the peer vanished
+        # while we were buffering), 10054 = reset by peer, 10058 = no buffer space, 10060 = not connected.
+        10053, 10054, 10058, 10060}
 
-    def _write(self, data) -> bool:
-        """Send a body, tolerating a peer that vanished mid-write.
+    @staticmethod
+    def _peer_vanished(e) -> bool:
+        """True only for an OSError whose errno says the socket, not the disk, is the problem.
 
-        A phone pulling to refresh, a curl `--max-time`, a proxy that gave up: they all close the socket
-        while we are still writing, and BaseHTTPRequestHandler lets the BrokenPipeError escape — killing the
-        handler thread and printing a traceback into the human's console for something that happens hundreds
-        of times a day and means nothing. Swallow exactly that, so a traceback that DOES appear still means a
-        bug. (The multi-MB screenshot is where it happens most, which is why this is under _bytes too.)
+        A bare `except OSError` here would also swallow a full-disk write, a closed log handle or a broken
+        pipe from the console — and on Windows the peer-abort code (WSAECONNABORTED/10053) does not even
+        subclass ConnectionResetError, so the named-exception tuple alone is not enough on that platform.
+        """
+        return isinstance(e, Handler.PEER_GONE) or (isinstance(e, OSError) and
+                                                    getattr(e, "errno", None) in Handler.PEER_ERRNOS)
+
+    def _respond(self, code, headers, body) -> bool:
+        """THE response funnel: write a whole HTTP response, tolerating a peer that vanished. False = gone.
+
+        My first attempt at this guarded only `wfile.write(body)`. The windows-latest soak then printed 33
+        tracebacks pointing at the `_json` call on the cross-origin refusal: the flush actually happens in
+        `end_headers()`/`send_header()`, not in the body write, and on Windows a peer that aborted while we
+        were buffering raises ConnectionAbortedError where Linux just hands you EPIPE on the next write.
+        Same class as every finding in this audit — an unanswered request looks exactly like a dead PC — and
+        it was only visible on the platform I cannot test on, which is the whole argument for the CI leg.
         """
         try:
-            self.wfile.write(data)
+            self.send_response(code)
+            for k, v in headers:
+                self.send_header(k, str(v))
+            self.end_headers()               # ← the flush; the header block is where Windows notices first
+            if body:
+                self.wfile.write(body)
             return True
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError as e:
+            # `except (self.PEER_GONE, OSError)` is a syntax-shaped trap, not a union: a class attribute that
+            # happens to be a tuple cannot be listed inside a tuple of exceptions, and Python only complains
+            # at RUNTIME ("catching classes that do not inherit from BaseException"), i.e. on the first
+            # request that trips it. Catch OSError — the parent of every one of those — and decide inside.
+            if not Handler._peer_vanished(e):
+                raise                      # a disk/console problem must stay loud
             self.close_connection = True
+            # `BaseHTTPRequestHandler.handle_one_request` ends with `self.wfile.flush()`. If I close the
+            # stream here (my first attempt) that flush raises ValueError: I/O operation on closed file — a
+            # NEW traceback, printed for the very non-event I am trying to silence. So replace it with an
+            # object that ignores both operations: the corpse is nobody's evidence, and nothing else in the
+            # handler writes to it.
+            class _Gone:
+                def flush(self): pass
+                def write(self, *a): return 0
+                def writable(self): return False
+                def close(self): pass
+            try:
+                if self.wfile is not None and not isinstance(self.wfile, _Gone):
+                    self.wfile = _Gone()
+            except Exception:
+                pass
             return False
 
+    def _json(self, code, obj):
+        body = json.dumps(obj, sort_keys=True, default=str).encode()
+        return self._respond(code, [("Content-Type", "application/json"),
+                                    ("Content-Length", len(body)),
+                                    ("Cache-Control", "no-store"),
+                                    ("X-Content-Type-Options", "nosniff")], body)
+
     def _bytes(self, code, data, mime, extra=None):
-        self.send_response(code)
-        self.send_header("Content-Type", mime)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        for k, v in (extra or {}).items():
-            self.send_header(k, str(v))
-        self.end_headers()
-        if data:
-            self._write(data)
+        hdrs = [("Content-Type", mime), ("Content-Length", len(data)),
+                ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff")]
+        hdrs += [(k, v) for k, v in (extra or {}).items()]
+        return self._respond(code, hdrs, data)
 
     def _token_ok(self, q) -> bool:
         given = self.headers.get("X-Token") or (q.get("t") or [""])[0] or \
@@ -918,12 +960,14 @@ class Handler(BaseHTTPRequestHandler):
         """
         try:
             super().finish()
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        except OSError as e:                    # the same rule as _respond: peer-gone is quiet, else raise
+            if not Handler._peer_vanished(e):
+                raise
             try:
                 self.connection.close()
             except Exception:
                 pass
-        except OSError:
+        except Exception:
             pass
 
     def _body(self):
