@@ -129,6 +129,14 @@ class Protocol(unittest.TestCase):
         srv = pceye.build(cls.port, cls.token, "127.0.0.1", 1440, os.path.join(cls.tmp.name, "t.log"),
                           dry_run=True)
         srv.RequestHandlerClass.screen = FakeScreen()
+        # /state prefers the OS geometry (`display_rect`) and only falls back to the injected screen, so on a
+        # real desktop it answers with the desktop's own resolution — 1024x768 on the Windows CI runner, where
+        # this class asserts 1920x1080. Until F43 that assertion was true on Windows only because a LATER class
+        # had welded a `display_rect` stub onto the shared handler and happened to run first under unittest's
+        # alphabetical loader. Pin the seam this test actually asserts about, and put it back: an assertion that
+        # means one thing on Linux and another on Windows is not a cross-platform test (AUDIT.md F44).
+        cls._seams = save_seams(srv.RequestHandlerClass, "display_rect")
+        srv.RequestHandlerClass.display_rect = staticmethod(lambda force=False: [0, 0, 1920, 1080])
         cls.srv = srv
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         cls.c = Client(f"http://127.0.0.1:{cls.port}", cls.token)
@@ -138,6 +146,7 @@ class Protocol(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown(); cls.srv.server_close()
         getattr(pceye.Handler, '_close_log', lambda: None)()          # the held log handle is class state; tests must not leak it
+        restore_seams(pceye.Handler, cls._seams)
         cls.tmp.cleanup()
 
     # ---- auth ----

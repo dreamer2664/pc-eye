@@ -7,7 +7,8 @@ Windows-only bugs (AUDIT.md F16) reached a human's machine through a chat window
 The suite runs twice, in two orders, on purpose. `unittest discover` loads classes A→Z; pytest loads them in
 source order. AUDIT.md F43 was a test that poisoned a shared class seam and only the second order could see it —
 so the gate had a runner-shaped hole, and green CI meant "green in the order CI happens to pick". One order is a
-coin flip; a gate may not be a coin flip.
+coin flip; a gate may not be a coin flip. The third pass runs each class alone in its own process, which is
+how you catch the inverse: a test that is green only because something before it left a stub behind.
 
   python3 tests/run_all.py            suite + docs check (fast, default)
   python3 tests/run_all.py --all      also run the measurement harnesses (bench, capture count, A/B)
@@ -80,6 +81,7 @@ def main():
     jobs = [
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
         [sys.executable, str(HERE / "run_ordered.py")],
+        [sys.executable, str(HERE / "run_ordered.py"), "--isolated"],
         [sys.executable, str(ROOT / "tools" / "check_docs.py")],
     ]
     if a.all:

@@ -44,6 +44,8 @@ $ python3 evidence/fuzz_protocol.py --requests 20000 --seed 7
 **Run both orders, or you have not run the suite.** `python3 tests/run_all.py` does this for you — it executes
 `unittest discover` (alphabetical, what CI does) *and* `tests/run_ordered.py` (source order, what pytest does).
 F43 was a test that corrupted a shared class seam: green under one order, red under the other, and CI only ever
-ran the first. If you add a test class that patches anything on `pceye.Handler`, save and restore it with
+ran the first. F44 was its sequel — a test that was green *because* of that leak, and only red once the leak was
+fixed. So `run_all.py` runs three passes over the suite: alphabetical (what CI does), source order, and every
+class alone in its own process (`--isolated`), which is the one that catches an assertion that needs company. If you add a test class that patches anything on `pceye.Handler`, save and restore it with
 `tests/test_pc_eye.py:save_seams/restore_seams` (a `staticmethod` read off a class is not a `staticmethod`
 written back) and make sure `ZSeamIntegrity` still passes in both orders.

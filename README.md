@@ -92,7 +92,7 @@ test box — a save-to-disk mode, not a browsing mode.
 
 ```
 python tests/run_all.py                       # the suite, and what CI runs
-python -m unittest discover -s tests          # 82 tests, headless-safe
+python3 tests/run_all.py               # 82 tests, three orders: CI's, source, and each class alone
 python evidence/bench.py --no-limit           # timings (needs a display for capture-side numbers)
 python evidence/capture_count.py              # pixel work per request, old tree vs new
 python evidence/negative_check.py             # proves the regression tests fail on 1.0.2
