@@ -60,10 +60,16 @@ def report(out, full=False):
                 # had been truncated away, in the file whose docstring says a red that cannot be read cannot be
                 # fixed. Keep the head of the block, then any line that states a verdict or a count.
                 bl = b.rstrip().splitlines()
-                extra = [l for l in bl[14:]
+                # F53, second half: keeping only the *summary* line still hid the payload. CI printed
+                # `hard failures: 3` and nothing else, because the three items are the next three lines and the
+                # cap stopped at 14. The first block gets more room (it explains the rest) and any line that
+                # reads like a finding or a verdict is kept from anywhere in the block.
+                head = 34 if keep == [] else 14
+                extra = [l for l in bl[head:]
                          if re.search(r"hard failures:|VERDICT|status codes:|server alive after|races \(|"
-                                      r"failures=|errors=|Ran ", l)]
-                keep.append("\n".join(bl[:14] + extra[:14]))
+                                      r"failures=|errors=|Ran |non-JSON body|client-side |stopped answering|"
+                                      r"Traceback \(most recent call last\)", l)]
+                keep.append("\n".join(bl[:head] + extra[:20]))
     else:                                   # no failure names: show everything, something is wrong
         keep = ["\n".join(lines[-12:])]
     summary = [l for l in lines if re.match(r"^(Ran |OK|FAILED|SKIPPED|VERDICT|\d+/\d+)", l.strip())]
