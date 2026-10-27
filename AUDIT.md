@@ -783,3 +783,24 @@ be executed against the text it will meet, which is what `tests/run_all.py` and 
 mine, same hour: a splice renamed `def main()` to `def count()` and left the module with no entry point —
 `NameError: name 'main' is not defined` — caught by running `python3 tools/check_docs.py` instead of trusting
 that an `ast.parse` of my own patch was enough. Parsing proves shape, not behaviour.)
+
+### Open, by evidence, not by oversight · the server can end a response before the body is whole under load
+
+Three `hard failures` on `windows-latest, 3.13` at `9bf68ca` were framing-level client errors (`IncompleteRead`
+family: the response ended before the promised `Content-Length` body was complete) and `server alive after:
+True` with zero tracebacks. `1f082f6`/`9bf68ca` differ only in whether those exceptions ask the control question;
+`944d187` — which asks it — is 4/4 green on all legs including both Windows ones.
+
+What is therefore **established**: under a 600-request soak on a loaded Windows runner, pc-eye can close a
+connection with a response half-written. What is **not established**: whether it can happen to a real agent on a
+real PC (the soak hammers one socket pattern the browser-shaped tests do not; `Content-Length` honesty itself is
+tested elsewhere and is green). It is deliberately tolerated here rather than hidden: the harness's rule is "if
+the server answers the control question, it is a cut connection, not a crash", and a cut connection under a
+self-inflicted load test on a shared runner is not a defect claim worth a revert.
+
+If anyone ever reports truncated JSON on Windows — a `/shot` that is not an image, a `/state` that will not
+parse — start here, in this order: (1) reproduce with `python3 evidence/fuzz_protocol.py --requests 4000 --seed
+17 --trace`, which prints the frames; (2) check whether the handler's `wfile` is being closed by
+`handle_one_request`'s timeout path while a response is buffered; (3) only then consider `protocol_version` /
+`Connection: close`, and remember F36's lesson that a closed socket already reads as a dead PC to an agent, so
+the fix must not be "close more eagerly".

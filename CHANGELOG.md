@@ -205,3 +205,8 @@ First live run on CarloPC. Found and fixed the DPI coordinate split (capture 192
   added to fix the first half (86 vs the 85 collected). `check_docs.suite_count()` now asks `unittest` for
   `countTestCases()` — the number the runner will run — with an AST fallback and a floor assertion so an empty
   result cannot pass.
+- **Known open behaviour, recorded not hidden** (after F54): under a 600-request soak on a loaded
+  `windows-latest` runner the server can end a connection with a response half-written; the control question
+  shows the server is alive, so the harness counts it as a cut connection rather than a crash, and CI is 4/4
+  green on `944d187`. Reproduction and the first three things to check are in AUDIT.md under "Open, by
+  evidence". Nobody should discover this by reading a tolerance in the harness and wondering what it covers.
