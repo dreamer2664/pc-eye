@@ -1185,6 +1185,12 @@ class ZSeamIntegrity(unittest.TestCase):
                         "a timeout is about the socket: it earns the control question instead of a crash report")
         self.assertTrue(fz.transport(ConnectionResetError("reset")))
         self.assertTrue(fz.transport(urllib.error.URLError(OSError("closed"))))
+        import http.client
+        self.assertTrue(fz.transport(http.client.IncompleteRead(b"partial")),
+                        "a response that ends mid-body is the connection being cut: ask the server, do not "
+                        "declare a crash")
+        self.assertFalse(fz.transport(json.JSONDecodeError("x", "y", 0)),
+                         "a 200 whose body is not the promised JSON is a finding, whatever the runner is doing")
         self.assertFalse(fz.transport(ValueError("bad json")),
                          "a content error is a protocol finding; whether the server is alive is beside the point")
         self.assertGreaterEqual(fz.REQ_TIMEOUT, 15,

@@ -134,7 +134,11 @@ def transport(e):
     client, so it has to be checked against the control question instead of counted as a crash.
     """
     if isinstance(e, (TimeoutError, ConnectionResetError, BrokenPipeError, RemoteDisconnected,
-                      http.client.BadStatusLine)):
+                      http.client.HTTPException)):
+        # `HTTPException` is the framing family — IncompleteRead (the response ended mid-body), BadStatusLine,
+        # LineTooLong. Like a reset, it is the connection being cut, so it earns the control question rather
+        # than being booked as a crash. A JSON decode error is deliberately NOT here: a 200 whose body is not
+        # the JSON the Content-Type promised is a pc-eye finding, and stays hard.
         return True
     if isinstance(e, urllib.error.URLError):
         return isinstance(e.reason, OSError)
