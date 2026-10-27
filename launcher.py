@@ -20,6 +20,7 @@ import platform
 import re
 import shutil
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -36,8 +37,52 @@ CLOUDFLARED_URL = ("https://github.com/cloudflare/cloudflared/releases/latest/do
 TUNNEL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
 
+MIN_BINARY_BYTES = 5_000_000          # cloudflared is ~40 MB; a 200-byte error page is not it
+
+
 def say(msg=""):
     print(msg, flush=True)
+
+
+def validate_binary(path: Path) -> tuple:
+    """Is this file plausibly the thing we downloaded? Cheap, and it turns a corrupt fetch into words.
+
+    The download is HTTPS from GitHub with no signature check, so a proxy that returns an HTML error page
+    used to be exec'd as if it were a binary. That is not a crash you can diagnose from a console window.
+    """
+    try:
+        size = path.stat().st_size
+        if size < MIN_BINARY_BYTES:
+            return False, f"{path.name} is only {size} B — that is not cloudflared, it is a " \
+                          f"download error page. Delete it and run again."
+        with open(path, "rb") as f:
+            head = f.read(2)
+        want = b"MZ" if platform.system() == "Windows" else b"\x7fE"
+        if head[:len(want)] != want:
+            return False, f"{path.name} starts with {head!r}, not a {platform.system()} executable header"
+        return True, f"{size / 1e6:.1f} MB, header ok"
+    except Exception as e:
+        return False, f"could not inspect {path.name}: {type(e).__name__}: {e}"
+
+
+def open_socket_on(port: int, host: str = "127.0.0.1", tries: int = 20):
+    """Grab a port, or say which is busy. A double-clicked start.bat that dies with an OSError
+    traceback about `[Errno 10048]` is how half the crew's first run ended: the real cause is that
+    pc-eye is already running — or something else is on 8790."""
+    last = None
+    for offset in range(tries):
+        candidate = port + offset
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, candidate))
+            sock.listen(128)
+            return sock, candidate, offset
+        except OSError as e:
+            last = e
+            sock.close()
+    raise OSError(f"no free port from {port} to {port + tries - 1} on {host}: {last}. "
+                  f"Is another pc-eye already running? Its window is your off switch.")
 
 
 def keep_awake():
@@ -52,7 +97,15 @@ def keep_awake():
 def ensure_cloudflared(quiet=False) -> Path | None:
     exe = HERE / ("cloudflared.exe" if platform.system() == "Windows" else "cloudflared")
     if exe.exists():
-        return exe
+        ok, why = validate_binary(exe)
+        if not ok:
+            say(f"  tunnel: {why} — deleting it and fetching again")
+            try:
+                exe.unlink()
+            except Exception:
+                pass
+        else:
+            return exe
     found = shutil.which("cloudflared")
     if found:
         return Path(found)
@@ -65,8 +118,16 @@ def ensure_cloudflared(quiet=False) -> Path | None:
         tmp.replace(exe)
         if platform.system() != "Windows":
             exe.chmod(0o755)
+        ok, why = validate_binary(exe)
+        if not ok:
+            say(f"  tunnel: what we downloaded is not usable — {why}")
+            try:
+                exe.unlink()
+            except Exception:
+                pass
+            return None
         if not quiet:
-            say(f"  tunnel: saved {exe.name} ({exe.stat().st_size / 1e6:.1f} MB)")
+            say(f"  tunnel: saved {exe.name} ({why})")
         return exe
     except Exception as e:
         say(f"  tunnel: could NOT get cloudflared ({type(e).__name__}: {e})")
@@ -84,20 +145,34 @@ def start_tunnel(port: int, exe: Path | None):
     except Exception as e:
         say(f"  tunnel: failed to start ({type(e).__name__}: {e})")
         return None, None
-    url, deadline = None, time.time() + 45
+    url, deadline, next_note = None, time.time() + 60, time.time() + 10
     while time.time() < deadline:
-        line = p.stdout.readline() if p.stdout else ""
+        if p.poll() is not None:
+            say("  tunnel: cloudflared exited before it gave us a URL — see its output above")
+            return None, None
+        try:
+            line = p.stdout.readline()
+        except Exception:
+            line = ""
         if not line:
-            if p.poll() is not None:
-                say("  tunnel: cloudflared exited — see its output above")
-                return None, None
             time.sleep(0.1)
+            if time.time() > next_note:
+                next_note = time.time() + 10
+                say("  tunnel: still waiting for cloudflared to register the route …")
             continue
         m = TUNNEL_RE.search(line)
         if m:
             url = m.group(0)
             break
     threading.Thread(target=lambda: [None for _ in p.stdout], daemon=True).start()   # drain the rest
+    if url is None:
+        say("  tunnel: gave up after 60s. A quick tunnel needs outbound HTTPS to api.trycloudflare.com; "
+            "a proxy, a firewall or a captive Wi-Fi will do exactly this.")
+        try:
+            p.terminate()                                  # do not leave a half-alive tunnel behind
+        except Exception:
+            pass
+        return None, None
     return url, p
 
 
@@ -108,9 +183,12 @@ def main(argv=None) -> int:
     ap.add_argument("--max-width", type=int, default=1440)
     ap.add_argument("--no-tunnel", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--allow-sleep", action="store_true",
+                    help="do not ask Windows to stay awake while the agent works")
+    ap.add_argument("--optimize", action="store_true", help="smaller JPEGs, slower encode (see server.py)")
     a = ap.parse_args(argv)
 
-    token = a.token or secrets.token_hex(4)
+    token = a.token or secrets.token_hex(16)
     say()
     say("  pc-eye — a window into this PC for an agent working in a chat")
     say("  " + "-" * 68)
@@ -126,17 +204,31 @@ def main(argv=None) -> int:
         say("  Fix that first: py -3 -m pip install pillow   (then run this again)")
         return 2
 
-    # 2. the server
-    srv = pceye.build(a.port, token, "127.0.0.1", a.max_width, str(HERE / "pceye.log"), a.dry_run)
+    # 2. the server — on a port we actually own, or we say who has it
+    try:
+        sock, port, moved = open_socket_on(a.port)
+    except OSError as e:
+        say(f"  server:  CANNOT START — {e}")
+        return 3
+    if moved:
+        say(f"  server:  port {a.port} was busy, using {port} instead")
+    srv = pceye.build(port, token, "127.0.0.1", a.max_width, str(HERE / "pceye.log"),
+                      a.dry_run, a.optimize, sock=sock)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    say(f"  server:  http://127.0.0.1:{a.port}/  (bound to this machine only)")
-    keep_awake()
+    say(f"  server:  http://127.0.0.1:{port}/  (bound to this machine only)")
+    if a.dry_run:
+        say("  *** DRY-RUN: nothing reaches the mouse or keyboard. Say so to the agent. ***")
+    if len(token) < 16:
+        say(f"  !! token is {len(token)} chars — this machine will be reachable from the internet and the "
+            f"token is the only lock on the door. Drop --token to get 32 characters.")
+    if not a.allow_sleep:
+        keep_awake()
 
     # 3. the tunnel
-    url = None
+    url, tunnel = None, None
     if not a.no_tunnel:
         exe = ensure_cloudflared()
-        url, _ = start_tunnel(a.port, exe)
+        url, tunnel = start_tunnel(port, exe)
         say(f"  tunnel:  {url}" if url else "  tunnel:  NOT established — the agent cannot reach this PC "
                                             "from the internet (local use only)")
     say("  " + "-" * 68)
@@ -170,7 +262,17 @@ def main(argv=None) -> int:
             time.sleep(3600)
     except KeyboardInterrupt:
         say("\n  stopped by the human at the keyboard")
-        srv.shutdown()
+    finally:
+        # A tunnel left running is a door left open by a window that was closed.
+        srv.shutdown(); srv.server_close()
+        if tunnel is not None:
+            try:
+                tunnel.terminate()
+                say("  tunnel: closed — the URL above stops working now")
+            except Exception:
+                pass
+        pceye.Handler._close_log()
+        say("  log: every action is in pceye.log next to this file")
     return 0
 
 

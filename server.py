@@ -40,8 +40,8 @@ SAFETY, STATED PLAINLY
 from __future__ import annotations
 
 import argparse
-import base64
 import datetime as dt
+import hashlib
 import hmac
 import io
 import json
@@ -54,13 +54,28 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = "1.0.0"
+VERSION = "1.0.3"
 SYSTEM = platform.system()
 DEFAULT_PORT = 8790
+# The whole product is "look, decide, act, look again" — so the limits below exist to keep a
+# chatty agent from hanging the machine it is driving. A 200k-character `type` holds the input
+# lock for 13 minutes and the human gets their keyboard back only when it finishes.
+MAX_TYPE_CHARS = 20000        # longer than any prompt/caption worth typing; use paste for more
+MAX_KEY_TIMES = 100           # times=1000000 was accepted and slept for ~83 minutes
+DISPLAY_TTL = 20.0            # seconds: how often we re-ask the OS for the display geometry
+REQ_BODY_MAX = 1_000_000      # 1 MB of JSON is generous; anything bigger is not an action
+ACT_RATE_PER_MIN = 120        # sustained input actions per minute (see RateBucket)
+SHOT_RATE_PER_MIN = 180       # a look-decide-act loop is ~1-2 req/s; this is 3/s, generous on purpose
+BURST_ACT, BURST_SHOT = 30, 60
+MAX_EASE_S = 5.0              # `move seconds=` is honoured now, and capped
+MAX_PASTE_CHARS = 200000      # clipboard text is cheap; still not unbounded
 # action name -> the method on Input that performs it. Kept beside the contract so a new action cannot
 # exist in the schema and be missing from the implementation (a test asserts the two match).
 METHOD = {"click": "click", "move": "move", "type": "type_text", "key": "key",
           "drag": "drag", "scroll": "scroll", "paste": "paste"}
+# actions that place the pointer — the ones a wrong coordinate space silently ruins
+POINTING_ACTIONS = ("click", "move", "drag", "scroll")
+COORD_TOL = 2               # px of tolerance before a landing counts as "not where you asked"
 ACTIONS = {
     # action    required fields            optional fields
     "click":   (("x", "y"),               ("button", "double", "clicks")),
@@ -112,12 +127,140 @@ def set_dpi_awareness() -> dict:
 
 
 def input_space():
-    """The rectangle the input calls actually live in, in this process's own coordinates."""
+    """The rectangle the input calls actually live in, in this process's own coordinates.
+
+    Wrapped in a guard for a reason: this runs on EVERY /act, and `ctypes.windll` does not exist on
+    Linux/macOS. The `SYSTEM != "Windows"` check above was the only thing between a non-Windows box and
+    an AttributeError raised inside the route handler — which does not answer 500, it drops the
+    connection, and "connection closed" is what a dead PC looks like to an agent.
+    """
     if SYSTEM != "Windows":
         return None
-    import ctypes
-    u32 = ctypes.windll.user32
-    return [u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)]
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        u32.GetSystemMetrics.restype = ctypes.c_int
+        w, h = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+        return [int(w), int(h)] if w and h else None
+    except Exception:
+        return None                                      # no verdict rather than a dead connection
+
+
+_display_cache = {"rect": None, "at": 0.0}
+
+
+def display_rect(force=False):
+    """Physical pixels of the whole virtual desktop — WITHOUT grabbing a single pixel.
+
+    /state used to learn the screen size by running `ImageGrab.grab(all_screens=True)` and
+    reading `.width/.height` off the result: a full lossless screen capture (tens of MB, and
+    on Windows DPI-awareness work on top of it) just to answer "how big is the monitor", and it
+    ran on *every* /shot too, since /state and /shot share the route. GetSystemMetrics says the
+    same thing in about a microsecond; Xlib says it here for the Linux test box.
+
+    Cached for DISPLAY_TTL seconds (geometry only changes if the human plugs something in), and
+    it reports the VIRTUAL desktop origin, so a monitor left of / above the main one — which
+    gives negative coordinates — is described correctly instead of being refused.
+    """
+    now = time.time()
+    if not force and _display_cache["rect"] and (now - _display_cache["at"]) < DISPLAY_TTL:
+        return _display_cache["rect"]
+    rect = None
+    try:
+        if SYSTEM == "Windows":
+            import ctypes
+            u32 = ctypes.windll.user32
+            SM_XVIRTUAL, SM_YVIRTUAL, SM_CXVIRTUAL, SM_CYVIRTUAL = 76, 77, 78, 79
+            x, y = u32.GetSystemMetrics(SM_XVIRTUAL), u32.GetSystemMetrics(SM_YVIRTUAL)
+            w, h = u32.GetSystemMetrics(SM_CXVIRTUAL), u32.GetSystemMetrics(SM_CYVIRTUAL)
+            if w > 0 and h > 0:
+                rect = [int(x), int(y), int(w), int(h)]
+        elif SYSTEM == "Linux":
+            import ctypes
+            x11 = ctypes.CDLL("libX11.so.6")
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            d = x11.XOpenDisplay(None)
+            if d:
+                s = x11.XDefaultScreenOfDisplay(d)      # c_void_p by default: fine for these calls
+                x11.XWidthOfScreen.restype = ctypes.c_int
+                x11.XHeightOfScreen.restype = ctypes.c_int
+                x11.XCloseDisplay.restype = ctypes.c_int
+                w, h = x11.XWidthOfScreen(s), x11.XHeightOfScreen(s)
+                x11.XCloseDisplay(d)
+                if w > 0 and h > 0:
+                    rect = [0, 0, int(w), int(h)]
+    except Exception:
+        rect = None                                      # no verdict rather than a wrong one
+    if rect:
+        _display_cache.update(rect=rect, at=now)
+    return rect
+
+
+def coord_gate(action, body, capture_full, in_space):
+    """May this action go to the OS? Pure, so every refusal is a test and not a Windows session.
+
+    Returns None to allow, or (status, payload) to refuse. Two spaces in one process is the
+    failure that LOOKS LIKE SUCCESS — the agent aims in image pixels, the pointer lives somewhere
+    else, and the reply says ok — so a mismatch is a hard stop, exactly as PC-EYE.md promises.
+    """
+    if action not in POINTING_ACTIONS:
+        return None
+    if not capture_full or not in_space:
+        return None                     # cannot judge; the bounds check below still guards the clamp
+    cw, ch = capture_full
+    iw, ih = in_space
+    if abs(cw / iw - 1.0) >= 0.01 or abs(ch / ih - 1.0) >= 0.01:
+        return 409, {"ok": False, "action": action,
+                     "error": f"eyes and hand are in different spaces: /shot returns {cw}x{ch} but the input "
+                              f"calls live in {iw}x{ih}. Every click would land somewhere other than where you "
+                              f"aimed, so /act refuses to guess a scale factor. Fix it on the PC: DPI awareness "
+                              f"did not take (see /state -> dpi.method). Do not work around this.",
+                     "coord_space": {"capture": [cw, ch], "input_space": [iw, ih], "consistent": False}}
+    return None
+
+
+def num(name, v, lo=None, hi=None, integer=True):
+    """One place that turns a query/body value into a number or raises a sentence an agent can act on.
+
+    Before this, `/shot?max=abc` ran `int("abc")` inside the route — the handler died, the tunnel
+    returned "connection closed without response", and the agent could not tell a typo from a dead PC.
+    """
+    if v is None or v == "":
+        return None
+    try:
+        out = int(v) if integer else float(v)
+    except (TypeError, ValueError):
+        want = "an integer" if integer else "a number"
+        raise ValueError(f"{name} must be {want} — got {v!r}")
+    if lo is not None and out < lo:
+        raise ValueError(f"{name} must be >= {lo} — got {out}")
+    if hi is not None and out > hi:
+        raise ValueError(f"{name} must be <= {hi} — got {out}")
+    return out
+
+
+class RateBucket:
+    """A tiny token bucket: burst, then a sustained rate. Fail-open by design.
+
+    This endpoint can click and type on a human's desktop, over a public tunnel, for an agent that
+    can loop by accident. A hard limiter that misfires would break real work, so on any weirdness
+    we allow the request; the point is to blunt a runaway loop, not to police a person.
+    """
+
+    def __init__(self, capacity, refill_per_s):
+        self.cap, self.rate, self.level, self.seen = capacity, refill_per_s, capacity, time.time()
+
+    def take(self, n=1.0) -> bool:
+        try:
+            now = time.time()
+            self.level = min(self.cap, self.level + (now - self.seen) * self.rate)
+            self.seen = now
+            if self.level >= n:
+                self.level -= n
+                return True
+            return False
+        except Exception:
+            return True
 
 
 def coord_space_report(capture_size, in_space) -> dict:
@@ -167,6 +310,13 @@ def parse_region(spec):
     return (x, y, w, h)
 
 
+def content_hash(data: bytes) -> str:
+    """Short hash of the encoded frame. It is what makes "tell me if anything changed" possible at
+    all: an agent watching a build, a download, a long compile, can poll for the cost of a header
+    instead of a few hundred kilobytes per look."""
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
 def z() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -179,12 +329,20 @@ class Screen:
     for "where do I click" survives it. Full resolution is available on request with `?max=0`.
     """
 
-    def __init__(self, max_width: int = 1440, quality: int = 72):
-        self.max_width, self.quality = max_width, quality
+    def __init__(self, max_width: int = 1440, quality: int = 72, optimize: bool = False):
+        self.max_width, self.quality, self.optimize = max_width, quality, optimize
         self.available = True
         self.why = ""
 
     def size(self):
+        """The honest way to ask how big the screen is: the OS, not a screen capture.
+
+        Kept as a method (and still Pillow-backed as the final fallback) because a test fakes it
+        and because `display_rect()` can legitimately know nothing on a box with no display.
+        """
+        rect = display_rect()
+        if rect:
+            return rect[2], rect[3]
         try:
             from PIL import ImageGrab
             img = ImageGrab.grab(all_screens=True)
@@ -193,8 +351,13 @@ class Screen:
             self.available, self.why = False, f"{type(e).__name__}: {e}"
             return None
 
-    def grab(self, region=None, max_width=None, fmt="jpeg", quality=None):
-        """Returns (bytes, dict) or raises RuntimeError with a sentence a human can act on."""
+    def grab(self, region=None, max_width=None, fmt="jpeg", quality=None, optimize=None):
+        """Returns (bytes, dict) or raises ValueError (the caller's mistake) / RuntimeError (the PC's).
+
+        `optimize=None` means "use self.optimize": JPEG Huffman-table optimisation costs ~25% of the
+        encode for ~5% of the bytes, and in the look-decide-act loop those milliseconds are what the
+        agent pays 200 times a session. Full-resolution PNG is the opposite trade and still available.
+        """
         try:
             from PIL import ImageGrab
         except Exception as e:
@@ -203,6 +366,15 @@ class Screen:
         r = parse_region(region)            # ValueError -> the route turns it into a 400 the agent can read
         if r:
             box = (r[0], r[1], r[0] + r[2], r[1] + r[3])
+            rect = display_rect()
+            if rect:                        # an out-of-bounds region must not read as a black screen
+                rx, ry, rw, rh = rect
+                if r[0] < rx or r[1] < ry or r[2] <= 0 or r[3] <= 0 or \
+                        r[0] + r[2] > rx + rw or r[1] + r[3] > ry + rh:
+                    raise ValueError(
+                        f"region {r} is outside the screen ({rw}x{rh} at {rx},{ry}) — returning it would "
+                        f"send you a black rectangle that looks like an empty desktop. "
+                        f"{'If the thing you want is off-screen, scroll first or take a wider /shot.' if (r[0] < rx or r[1] < ry) else 'Check the numbers against X-Screen-Full.'}")
         try:
             try:
                 img = ImageGrab.grab(bbox=box, all_screens=True)
@@ -220,17 +392,20 @@ class Screen:
             scaled = True
         buf = io.BytesIO()
         if fmt == "png":
-            img.save(buf, "PNG", optimize=True)
+            img.save(buf, "PNG", optimize=bool(self.optimize if optimize is None else optimize))
             mime = "image/png"
         else:
             q = self.quality if quality is None else int(quality)
+            opt = self.optimize if optimize is None else bool(optimize)
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
-            img.save(buf, "JPEG", quality=q, optimize=True)
+            img.save(buf, "JPEG", quality=q, optimize=opt)
             mime = "image/jpeg"
         data = buf.getvalue()
         meta = {"full": list(full), "sent": [img.width, img.height], "scaled": scaled,
-                "bytes": len(data), "mime": mime, "format": fmt, "at": z()}
+                "bytes": len(data), "mime": mime, "format": fmt, "quality": q,
+                "optimize": bool(self.optimize if optimize is None else optimize),
+                "at": z(), "hash": content_hash(data)}
         return data, meta
 
 
@@ -329,19 +504,48 @@ class Input:
                                f"this server is meant to run on the PC")
 
     def move(self, x, y, seconds=0.0):
+        """`seconds` used to be accepted and ignored: the docs promised an eased path, the code teleported.
+
+        A slow ease is genuinely useful (some apps only track a moving pointer, and a drag that starts
+        with a teleport can miss the handle), so it is now real — and capped, because `seconds=3600` was
+        also accepted and would have held the input lock for an hour.
+        """
+        secs = float(seconds or 0)
+        if secs < 0:
+            raise ValueError("seconds must be >= 0")
+        secs = min(secs, MAX_EASE_S)
         if self.dry_run:
-            self.did.append(("move", x, y)); return
+            self.did.append(("move", x, y, round(secs, 3))); return
         if SYSTEM == "Windows":
-            self._move_windows(x, y)
+            if secs <= 0:
+                self._move_windows(x, y); return
+            sx, sy = cursor_pos() or [0, 0]
+            steps = max(2, int(secs / 0.008))
+            for i in range(1, steps + 1):
+                self._move_windows(sx + (x - sx) * i / steps, sy + (y - sy) * i / steps)
+                time.sleep(secs / steps)
+            self._move_windows(x, y)          # land exactly, not one step short
 
     def type_text(self, text, interval=0.004):
+        n = len(str(text))
+        if n > MAX_TYPE_CHARS:
+            raise RuntimeError(f"{n} characters is more than one action should be ({MAX_TYPE_CHARS} max) — "
+                               f"each keystroke is injected and verified, so this would hold the keyboard for "
+                               f"{n * 0.004:.0f}s. Use `paste`, or send it in pieces.")
         if self.dry_run:
             self.did.append(("type", text)); return
         if SYSTEM == "Windows":
-            self._type_windows(text, interval)
+            self._type_windows(text, max(0.0, float(interval)))
 
     def paste(self, text):
-        """Clipboard + Ctrl+V — the fast, drop-free path (qcaptcha's default delivery mode)."""
+        """Clipboard + Ctrl+V — the fast, drop-free path (qcaptcha's default delivery mode).
+
+        Returns True/False for "did the clipboard take it"; the ROUTE turns False into a 503, because
+        a 200 with `pasted: false` inside it is precisely the ok-shaped lie this whole file exists to kill.
+        """
+        n = len(str(text))
+        if n > MAX_PASTE_CHARS:
+            raise RuntimeError(f"paste of {n} chars exceeds {MAX_PASTE_CHARS} — send it in pieces")
         if self.dry_run:
             self.did.append(("paste", text)); return False
         if SYSTEM != "Windows":
@@ -351,6 +555,7 @@ class Input:
             return False
         u32 = self._u32()
         VK_CONTROL, VK_V, KEYEVENTF_KEYUP = 0x11, 0x56, 0x0002
+        time.sleep(0.03)                      # let the clipboard settle before the keystroke arrives
         u32.keybd_event(VK_CONTROL, 0, 0, 0)
         u32.keybd_event(VK_V, 0, 0, 0)
         u32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
@@ -380,17 +585,27 @@ class Input:
             codes = [self.KEYS[p] if p in self.KEYS else ord(p.upper()) for p in parts]
         elif name in self.KEYS:
             codes = [self.KEYS[name]]
-        elif len(name) == 1 and name.isalnum():
-            codes = [ord(name.upper())]        # VK codes for A-Z/0-9 are their ASCII values
-        elif len(name) != 1:
+        elif len(name) == 1:
+            # A single character goes through the Unicode key path, NOT a raw VK code: `keybd_event(VK_OEM…)`
+            # without shift produces nothing, or the wrong thing, for everything outside A-Z/0-9 — and the
+            # old code accepted `-`, `/`, `.` and replied ok. KEYEVENTF_UNICODE is what `type` already uses.
+            codes = None
+        else:
             raise RuntimeError(f"unknown key {key!r} — use a single character, one of {sorted(self.KEYS)}, "
                                f"or a chord like ctrl+s")
+        try:
+            times = int(times if times is not None else 1)
+        except (TypeError, ValueError):
+            raise ValueError(f"key times must be an integer — got {times!r}")
+        if times > MAX_KEY_TIMES:
+            raise RuntimeError(f"key times={times} exceeds {MAX_KEY_TIMES} — that would hold the "
+                               f"keyboard for {times * 0.03:.0f}s of nothing useful")
         if self.dry_run:
             self.did.append(("key", name, times)); return
         if SYSTEM != "Windows":
             raise RuntimeError("key is Windows-only in this build")
         u32 = self._u32()
-        if len(name) == 1 and codes is None:
+        if codes is None:                     # single character: unicode path, shift-free and exact
             self._type_windows(name)
             return
         for _ in range(max(1, int(times))):
@@ -411,9 +626,11 @@ class Input:
         u32.SetCursorPos(int(x), int(y)); time.sleep(0.08)
         u32.mouse_event(down, 0, 0, 0, 0)
         steps = 18
-        for i in range(1, steps + 1):
+        for i in range(1, steps):            # up to, not including: the last step is an exact landing
             u32.SetCursorPos(int(x + (x2 - x) * i / steps), int(y + (y2 - y) * i / steps))
             time.sleep(max(0.01, seconds / steps))
+        u32.SetCursorPos(int(x2), int(y2))   # with 18 steps and int() truncation the old loop let go ~1px short
+        time.sleep(0.02)
         u32.mouse_event(up, 0, 0, 0, 0)
 
     def scroll(self, clicks=-3, x=None, y=None):
@@ -431,12 +648,16 @@ class Input:
 def cursor_pos():
     if SYSTEM != "Windows":
         return None
-    import ctypes
-    class P(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-    p = P()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
-    return [p.x, p.y]
+    try:
+        import ctypes
+
+        class P(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+        p = P()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(p))
+        return [p.x, p.y]
+    except Exception:
+        return None                                      # cursor_pos() is read on every reply: never throw
 
 
 # ------------------------------------------------------------------ server ---
@@ -446,14 +667,72 @@ class Handler(BaseHTTPRequestHandler):
     inp: Input = None
     token: str = ""
     log_path: str = "pceye.log"
+    dry_run: bool = False                 # visible in every reply: a fake must never look real
+    # seams, not shortcuts: tests patch these two and exercise the real routes on Linux
+    input_space = staticmethod(input_space)
+    display_rect = staticmethod(display_rect)
+    limits: list = None                   # [RateBucket for /act, RateBucket for /shot]
+    _log_lock = threading.Lock()
+    _log_fh = None
+    _log_at = 0.0
 
     # -- helpers --
+    def _guard(self, cost=1.0):
+        """Refuse to read a body we have no intention of parsing, and reject a cross-origin form POST."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._json(400, {"ok": False, "error": "Content-Length must be a number"})
+            return False
+        if n > REQ_BODY_MAX:
+            self._json(413, {"ok": False, "error": f"body of {n} bytes exceeds {REQ_BODY_MAX} — "
+                                                   f"one action cannot need that much"})
+            return False
+        return True
+
+    def _same_origin(self) -> bool:
+        """Two things must be true for an /act to be accepted from a browser-ish client.
+
+        A POST with a CORS-"simple" shape (no custom headers, Content-Type of form/text/plain) is sent by
+        a web page without any preflight. That is the one way a page on the human's own browser can aim the
+        mouse just because the tunnel URL was pasted somewhere — and a token in a URL outlives the session:
+        history, proxy logs, the phone that opened it. So:
+
+          * an explicit Origin that is not this host is refused outright (403, in words);
+          * a body that is not `application/json` is refused — which a browser cannot forge without
+            triggering a preflight, and which no real agent has to care about;
+          * a request with no Origin header at all (curl, python, an HTTP client in a chat) is allowed,
+            because the token is what authenticates it.
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._json(415, {"ok": False, "error": f"Content-Type must be application/json — got "
+                                                    f"{ctype or 'nothing'!r}. A web page can send anything "
+                                                    f"else without asking permission first, so /act does not "
+                                                    f"accept it. Real clients set the header."})
+            return False
+        origin = self.headers.get("Origin")
+        site = (self.headers.get("Sec-Fetch-Site") or "").lower()
+        if site == "same-origin" and not origin:
+            return True
+        if origin in (None, "") and not site:
+            return True                                  # not a browser: a script, curl, an agent
+        if site == "same-origin":
+            return True
+        host = (self.headers.get("Host") or "").split(":")[0]
+        try:
+            o = urlparse(origin).netloc.split(":")[0] if origin else ""
+        except Exception:
+            o = ""
+        return bool(o) and o == host
+
     def _json(self, code, obj):
         body = json.dumps(obj, sort_keys=True, default=str).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -462,10 +741,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (extra or {}).items():
             self.send_header(k, str(v))
         self.end_headers()
-        self.wfile.write(data)
+        if data:
+            self.wfile.write(data)
 
     def _token_ok(self, q) -> bool:
         given = self.headers.get("X-Token") or (q.get("t") or [""])[0] or \
@@ -473,16 +754,32 @@ class Handler(BaseHTTPRequestHandler):
         return bool(given) and hmac.compare_digest(str(given), self.token)
 
     def _log(self, line):
-        """Console always; file best-effort but LOUD — a run whose log silently vanished is not reviewable."""
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(f"{z()} {line}\n")
-        except Exception as e:
-            if not getattr(Handler, "_log_warned", False):
-                Handler._log_warned = True
-                print(f"  !! cannot write {self.log_path} ({type(e).__name__}: {e}) — actions will only be "
-                      f"printed here, not recorded", flush=True)
+        """Console always; file best-effort but LOUD — a run whose log silently vanished is not reviewable.
+
+        The handle is held open (a Windows FILE_APPEND_DATA per request was pure overhead) and reopened
+        if the path goes away, so `del pceye.log` mid-run does not quietly end the record.
+        """
         print(f"  {z()} {line}", flush=True)
+        for _ in range(2):
+            try:
+                with self._log_lock:
+                    if Handler._log_fh is None or (time.time() - Handler._log_at) > 5.0:
+                        if Handler._log_fh:
+                            try:
+                                Handler._log_fh.close()
+                            except Exception:
+                                pass
+                        Handler._log_fh = open(self.log_path, "a", encoding="utf-8", buffering=1)
+                        Handler._log_at = time.time()
+                    Handler._log_fh.write(f"{z()} {line}\n")
+                return
+            except Exception as e:
+                Handler._log_fh = None
+                if not getattr(Handler, "_log_warned", False):
+                    Handler._log_warned = True
+                    print(f"  !! cannot write {self.log_path} ({type(e).__name__}: {e}) — actions will only be "
+                          f"printed here, not recorded", flush=True)
+                return
 
     def log_message(self, fmt, *a):          # keep the console readable: one line per request
         pass
@@ -491,9 +788,14 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
         try:
-            return json.loads(raw.decode() or "{}")
+            body = json.loads(raw.decode() or "{}")
         except Exception:
-            raise ValueError("body must be JSON")
+            raise ValueError("body must be a JSON object, e.g. {\"action\":\"click\",\"x\":10,\"y\":10}")
+        if not isinstance(body, dict):
+            # a bare list/string/number used to reach `body.get` and kill the handler: the agent saw
+            # "connection closed", which reads exactly like "the PC is down".
+            raise ValueError(f"body must be a JSON object, not {type(body).__name__}")
+        return body
 
     # -- routes --
     def do_GET(self):
@@ -510,47 +812,84 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(401, {"ok": False, "error": "bad or missing token",
                                     "hint": "add ?t=TOKEN, or the X-Token header"})
         if u.path == "/state":
-            sz = self.screen.size()
-            space = coord_space_report(sz, input_space())
+            # The coordinate-space verdict used to cost a whole screen capture (Screen.size() grabbed
+            # pixels to read .width). display_rect() asks the OS instead, and /state has never been
+            # the route an agent can afford to poll — so now it does no capture at all.
+            rect = self.display_rect()
+            sz = (rect[2], rect[3]) if rect else self.screen.size()
+            space = coord_space_report(sz, self.input_space())
             return self._json(200, {"ok": True, "version": VERSION, "host": platform.node(), "os": SYSTEM,
                                     "screen": list(sz) if sz else None, "capture_ok": self.screen.available,
                                     "capture_why": self.screen.why or None, "cursor": cursor_pos(),
                                     "uptime_s": int(time.time() - START), "last": LAST,
                                     "dpi": getattr(Handler, "dpi", {}),
+                                    "dry_run": bool(self.dry_run),
                                     "coord_space": space, "at": z()})
         if u.path == "/shot":
-            region = (q.get("region") or [None])[0]
-            fmt = (q.get("fmt") or ["jpeg"])[0]
-            maxw = q.get("max") or [None]
-            maxw = int(maxw[0]) if maxw and maxw[0] not in (None, "") else None
+            if not self._bucket(1):
+                self.send_header("Retry-After", "2") if False else None
+                return self._json(429, {"ok": False,
+                                        "error": f"more than {SHOT_RATE_PER_MIN} shots/min — you are polling "
+                                                 f"faster than a human can act. Watching something load? Use "
+                                                 f"/shot?changed=HASH and pay a header, not a frame.",
+                                        "retry_after_s": 2})
             try:
-                data, meta = self.screen.grab(region=region, max_width=maxw, fmt=fmt)
+                region = (q.get("region") or [None])[0]
+                fmt = (q.get("fmt") or ["jpeg"])[0]
+                if fmt not in ("jpeg", "png"):
+                    raise ValueError(f"fmt must be jpeg or png — got {fmt!r}")
+                maxw = num("max", (q.get("max") or [None])[0], lo=0, hi=7680)
+                qual = num("quality", (q.get("quality") or [None])[0], lo=1, hi=95)
+                opt = {"1": True, "0": False, "yes": True, "no": False,
+                       "": None}.get((q.get("opt") or [""])[0].lower(), None)
+                if opt is None and (q.get("opt") or [None])[0] not in (None, ""):
+                    raise ValueError(f"opt must be 1 or 0 — got {(q.get('opt') or [''])[0]!r}")
+                want = (q.get("changed") or [None])[0]
             except ValueError as e:                 # a bad argument: the agent's mistake, not the PC's
+                return self._json(400, {"ok": False, "error": str(e)})
+            try:
+                data, meta = self.screen.grab(region=region, max_width=maxw, fmt=fmt, quality=qual,
+                                              optimize=opt)
+            except ValueError as e:                 # e.g. a region off the edge of the screen
                 return self._json(400, {"ok": False, "error": str(e)})
             except RuntimeError as e:               # the machine could not do it: a different problem
                 return self._json(503, {"ok": False, "error": str(e)})
-            self._log(f"shot {meta['sent']} {meta['bytes']}B scaled={meta['scaled']}")
+            except OSError as e:                    # Pillow rejects a bad save() argument this way
+                return self._json(400, {"ok": False, "error": f"bad image settings: {type(e).__name__}: {e}"})
             # The agent needs both sizes to convert what it sees into where it clicks. Sent as headers so
             # the arithmetic never depends on a second request landing between the shot and the click.
-            return self._bytes(200, data, meta["mime"], {
-                "X-Screen-Full": f"{meta['full'][0]}x{meta['full'][1]}",
-                "X-Screen-Sent": f"{meta['sent'][0]}x{meta['sent'][1]}"})
+            hdr = {"X-Screen-Full": f"{meta['full'][0]}x{meta['full'][1]}",
+                   "X-Screen-Sent": f"{meta['sent'][0]}x{meta['sent'][1]}",
+                   "X-Screen-Hash": meta.get("hash") or content_hash(data)}
+            if want:                                # watching a build: pay a header, not a frame
+                if hmac.compare_digest(str(want), hdr["X-Screen-Hash"]):
+                    self._log(f"shot unchanged ({hdr['X-Screen-Hash'][:8]})")
+                    return self._bytes(304, b"", "text/plain", hdr)
+            self._log(f"shot {meta['sent']} {meta['bytes']}B scaled={meta['scaled']} "
+                      f"opt={int(meta.get('optimize', False))}")
+            return self._bytes(200, data, meta["mime"], hdr)
         if u.path == "/selftest":
-            out = {"ok": True, "version": VERSION, "checks": []}
+            out = {"ok": True, "version": VERSION, "dry_run": bool(self.dry_run), "checks": []}
             def chk(name, ok, detail=""):
                 out["checks"].append({"name": name, "ok": bool(ok), "detail": str(detail)[:200]})
                 out["ok"] = out["ok"] and bool(ok)
+            if self.dry_run:
+                out["checks"].append({"name": "TEST-MODE", "ok": True,
+                                      "detail": "dry-run: NOTHING is sent to the mouse or keyboard. "
+                                                "Every ok in this build is a protocol pass, not a PC."})
             try:
                 data, meta = self.screen.grab()
                 chk("capture", len(data) > 1000, f"{meta['sent']} {meta['bytes']}B")
-            except RuntimeError as e:
+            except (RuntimeError, ValueError) as e:
                 chk("capture", False, str(e))
-            chk("token", bool(self.token), "a token was generated" if self.token else "NO TOKEN")
+            chk("token", len(self.token or "") >= 16,
+                f"{len(self.token or '')} chars" if self.token else "NO TOKEN")
             chk("platform", SYSTEM == "Windows", f"os={SYSTEM}" +
                 ("" if SYSTEM == "Windows" else " — clicks and keys are Windows-only in this build"))
             try:
-                sz = self.screen.size()
-                space = coord_space_report(sz, input_space())
+                rect = self.display_rect()
+                sz = (rect[2], rect[3]) if rect else self.screen.size()
+                space = coord_space_report(sz, self.input_space())
                 chk("coordinate-space", space["consistent"] is not False,
                     space["warning"] or f"eyes and hand agree ({sz[0]}x{sz[1]})")
                 chk("dpi-aware", bool(getattr(Handler, "dpi", {}).get("dpi_aware")),
@@ -558,20 +897,55 @@ class Handler(BaseHTTPRequestHandler):
                     getattr(Handler, "dpi", {}).get("error") or "not reported")
             except Exception as e:
                 chk("coordinate-space", False, f"could not determine: {type(e).__name__}: {e}")
-            chk("log-writable", os.access(self.log_path, os.W_OK) or not os.path.exists(self.log_path),
-                self.log_path)
+            # the old check asked os.access() about a path whose parent did not exist and called it
+            # writable. The only honest test of a log is the write.
+            try:
+                self._log("selftest log-write probe")
+                chk("log-writable", os.path.exists(self.log_path), self.log_path)
+            except Exception as e:
+                chk("log-writable", False, f"{self.log_path}: {type(e).__name__}: {e}")
             return self._json(200, out)
         return self._json(404, {"ok": False, "error": f"no route {u.path}",
                                 "routes": ["/state", "/shot", "/act", "/selftest"]})
 
+    @classmethod
+    def _close_log(cls):
+        """Release the held log handle. Tests and shutdown must be able to prove they leave nothing open."""
+        with cls._log_lock:
+            if cls._log_fh:
+                try:
+                    cls._log_fh.close()
+                except Exception:
+                    pass
+            cls._log_fh = None
+
+    def _bucket(self, idx, cost=1.0):
+        try:
+            if not self.limits:
+                return True
+            return self.limits[idx].take(cost)
+        except Exception:
+            return True                             # a limiter that breaks must not break the PC's owner
+
     def do_POST(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        if u.path != "/act":
+            return self._json(404, {"ok": False, "error": f"no route {u.path}"})
+        if not self._same_origin():
+            return self._json(403, {"ok": False, "error": "cross-origin POST is refused — a browser on this "
+                                                           "PC must not be able to drive it from a web page"})
         if not self._token_ok(q):
             return self._json(401, {"ok": False, "error": "bad or missing token",
                                     "hint": "add ?t=TOKEN, or the X-Token header"})
-        if u.path != "/act":
-            return self._json(404, {"ok": False, "error": f"no route {u.path}"})
+        if not self._guard():
+            return
+        if not self._bucket(0):
+            return self._json(429, {"ok": False,
+                                    "error": f"more than {ACT_RATE_PER_MIN} actions/min — a loop is spinning "
+                                             f"on the human's keyboard. Stop, take one /shot, and think "
+                                             f"before the next action.",
+                                    "retry_after_s": 5})
         try:
             body = self._body()
         except ValueError as e:
@@ -588,9 +962,27 @@ class Handler(BaseHTTPRequestHandler):
         if extra:
             return self._json(400, {"ok": False, "error": f"{action} has no field(s) {extra} — a typo must "
                                                           f"not ride along to the OS"})
-        # A coordinate outside the space the INPUT calls live in would be silently clamped to the edge and
-        # land on something else. That is the failure that looks like success, so it is refused in words.
-        space = input_space()
+        # Numbers are parsed HERE, once, so a `x: "banana"` is a 400 that names the field instead of an
+        # AttributeError inside ctypes that the agent reads as "the PC is broken".
+        try:
+            coords = {k: num(k, body.get(k), integer=True) for k in ("x", "y", "x2", "y2") if k in body}
+        except ValueError as e:
+            return self._json(400, {"ok": False, "action": action, "error": str(e) + " — an integer pixel value"})
+        for k, v in list(coords.items()):
+            if v is None:
+                return self._json(400, {"ok": False, "action": action,
+                                        "error": f"{k} must be an integer pixel value — got {body[k]!r}"})
+            coords[k] = v
+        if coords:
+            body.update(coords)
+        # The clamp bug and the DPI bug are the SAME bug seen twice: a coordinate the hand cannot reach
+        # lands somewhere else, and a split coordinate space means every coordinate is that way. Both are
+        # refused in words before anything touches the OS. input_space() is the primary monitor (that is
+        # what SetCursorPos clamps against); display_rect() is the whole virtual desktop, which is what
+        # /shot returns — so a second monitor's negative coordinates are described, not refused.
+        space = self.input_space()
+        rect = self.display_rect()
+        cap = (rect[2], rect[3]) if rect else self.screen.size()
         if space:
             for kx, ky in (("x", "y"), ("x2", "y2")):
                 if body.get(kx) is None or body.get(ky) is None:
@@ -603,47 +995,79 @@ class Handler(BaseHTTPRequestHandler):
                                                      f"would silently land somewhere else. This is what "
                                                      f"/state -> coord_space reports on.",
                                             "input_space": space})
+        gate = coord_gate(action, body, cap, space)
+        if gate:
+            code, payload = gate
+            self._log(f"REFUSED {action}: {payload['error'][:120]}")
+            return self._json(code, payload)
         args = {k: v for k, v in body.items() if k != "action"}
         try:
             with LOCK:
-                result = getattr(self.inp, METHOD[action])(**args) if action != "paste" else \
-                         {"pasted": self.inp.paste(args["text"])}
-                LAST.update(action=action, at=z(), args={k: (v if k != "text" else f"{len(str(v))} chars")
-                                                          for k, v in args.items()})
+                if action == "paste":
+                    if not self.inp.paste(args["text"]):
+                        raise RuntimeError("the clipboard would not open (another app is holding it) — "
+                                          "the text was NOT pasted")
+                    result = {"pasted": True}
+                else:
+                    result = getattr(self.inp, METHOD[action])(**args)
+                LAST.update(action=action, at=z(), dry_run=bool(self.dry_run),
+                            args={k: (v if k != "text" else f"{len(str(v))} chars") for k, v in args.items()})
         except RuntimeError as e:
             self._log(f"REFUSED {action}: {e}")
-            return self._json(409, {"ok": False, "action": action, "error": str(e)})
+            return self._json(409, {"ok": False, "action": action, "error": str(e), "dry_run": bool(self.dry_run)})
+        except ValueError as e:                      # a bad argument that the method itself caught
+            return self._json(400, {"ok": False, "action": action, "error": str(e)})
         except TypeError as e:
             return self._json(400, {"ok": False, "action": action, "error": f"bad arguments: {e}"})
         except Exception as e:
             self._log(f"ERROR {action}: {type(e).__name__}: {e}")
             return self._json(500, {"ok": False, "action": action, "error": f"{type(e).__name__}: {e}"})
         args_show = {k: (f"{len(str(v))} chars" if k == "text" else v) for k, v in args.items()}
-        out = {"ok": True, "action": action, "did": args_show, "cursor": cursor_pos(), "at": z()}
-        if action in ("click", "move", "drag") and body.get("x") is not None and body.get("y") is not None:
+        out = {"ok": True, "action": action, "did": args_show, "cursor": cursor_pos(), "at": z(),
+               "dry_run": bool(self.dry_run)}
+        if isinstance(result, dict):
+            out.update(result)
+        if self.dry_run:
+            out["note"] = "dry-run: this action was recorded, NOT delivered to Windows"
+        if action in POINTING_ACTIONS and body.get("x") is not None and body.get("y") is not None:
             landed = out["cursor"]
             if landed:                      # None in dry-run / non-Windows: then we simply do not claim it
                 off = (landed[0] - int(body["x"]), landed[1] - int(body["y"]))
                 out["landed"], out["off_by"] = landed, list(off)
-                out["exact"] = abs(off[0]) <= 2 and abs(off[1]) <= 2
+                out["exact"] = abs(off[0]) <= COORD_TOL and abs(off[1]) <= COORD_TOL
                 if not out["exact"]:
                     out["warning"] = (f"pointer is at {landed}, not {(body['x'], body['y'])} — the click went to "
                                       f"where the pointer actually is. Treat this action as NOT having done "
                                       f"what you asked, and check /state -> coord_space.")
                     self._log(f"act {action} MISMATCH asked=({body['x']},{body['y']}) landed={landed}")
-        self._log(f"act {action} {json.dumps(args_show, sort_keys=True)} -> ok"
-                  f"{'' if out.get('exact', True) else ' (mismatch)'}")
+        self._log(f"act {action} {json.dumps(args_show, sort_keys=True)} -> "
+                  f"{'DRY-RUN' if self.dry_run else 'ok'}{'' if out.get('exact', True) else ' (mismatch)'}")
         return self._json(200, out)
 
 
-def build(port: int, token: str, host: str = "127.0.0.1", max_width: int = 1440,
-          log_path: str = "pceye.log", dry_run: bool = False):
+def configure(token, max_width=1440, log_path="pceye.log", dry_run=False, optimize=False):
+    """Install the run's configuration on the handler. Separate from the socket so the launcher can bind
+    a port FIRST (and say which one is busy) without a race between 'is it free' and 'I want it'."""
     Handler.dpi = set_dpi_awareness()          # before anything captures or clicks
-    Handler.screen = Screen(max_width=max_width)
+    Handler.screen = Screen(max_width=max_width, optimize=optimize)
     Handler.inp = Input(dry_run=dry_run)
+    Handler.dry_run = bool(dry_run)
+    Handler.limits = [RateBucket(BURST_ACT, ACT_RATE_PER_MIN / 60.0),
+                      RateBucket(BURST_SHOT, SHOT_RATE_PER_MIN / 60.0)]
     Handler.token = token
     Handler.log_path = log_path
-    return ThreadingHTTPServer((host, port), Handler)
+    return Handler
+
+
+def build(port: int, token: str, host: str = "127.0.0.1", max_width: int = 1440,
+          log_path: str = "pceye.log", dry_run: bool = False, optimize: bool = False, sock=None):
+    cls = configure(token, max_width, log_path, dry_run, optimize)
+    if sock is not None:                       # pre-bound: ThreadingHTTPServer will not bind again
+        srv = ThreadingHTTPServer((host, port), cls, bind_and_activate=False)
+        srv.socket = sock
+        srv.server_activate()
+        return srv
+    return ThreadingHTTPServer((host, port), cls)
 
 
 def main(argv=None) -> int:
@@ -655,9 +1079,17 @@ def main(argv=None) -> int:
     ap.add_argument("--log", default="pceye.log")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="never touch the mouse or keyboard (tests)")
+    ap.add_argument("--optimize", action="store_true",
+                    help="smaller JPEGs (~5%%) for a slower encode (~25%%); off by default — the agent "
+                         "pays the milliseconds 200 times a session, nobody reads the bytes")
+    ap.add_argument("--version", action="version", version=f"pc-eye {VERSION}")
     a = ap.parse_args(argv)
-    token = a.token or secrets.token_hex(4)
-    srv = build(a.port, token, a.host, a.max_width, a.log, a.dry_run)
+    token = a.token or secrets.token_hex(16)
+    if len(token) < 16 and not a.dry_run:
+        print(f"  !! token is {len(token)} chars. This machine is reachable from the internet through the "
+              f"tunnel and the token is the ONLY thing between a stranger and your mouse. "
+              f"Drop --token and let it generate 32.", flush=True)
+    srv = build(a.port, token, a.host, a.max_width, a.log, a.dry_run, optimize=a.optimize)
     if a.selftest:
         s = Handler.screen
         try:
@@ -668,13 +1100,18 @@ def main(argv=None) -> int:
             return 1
         return 0
     print(f"pc-eye {VERSION} on {platform.node()} ({SYSTEM})", flush=True)
+    if a.dry_run:
+        print("  *** DRY-RUN: nothing reaches the mouse or keyboard. The agent must be told. ***", flush=True)
     print(f"  local:  http://{a.host}:{a.port}/  (token: {token})", flush=True)
+    print(f"  token:  {len(token)} chars · give the URL+token to the agent only, never to a wire", flush=True)
     print(f"  log:    {os.path.abspath(a.log)}", flush=True)
     print(f"  stop:   Ctrl+C here, or close this window", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("stopped by the human at the keyboard", flush=True)
+    finally:
+        Handler._close_log()
     return 0
 
 

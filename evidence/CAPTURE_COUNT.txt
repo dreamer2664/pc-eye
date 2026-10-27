@@ -1,0 +1,73 @@
+  2026-10-27T07:29:53Z shot [1920, 1080] 1204B scaled=True
+  2026-10-27T07:29:53Z shot [1920, 1080] 1204B scaled=False
+  2026-10-27T07:29:53Z shot [1920, 1080] 1204B scaled=True opt=0
+  2026-10-27T07:29:53Z shot [1920, 1080] 1204B scaled=False opt=0
+  2026-10-27T07:29:53Z selftest log-write probe
+
+== OS geometry KNOWN    : pixel captures per request (old 1.0.0 vs new 1.0.3) ==
+route             old    new  effect
+/state              1      0  FASTER
+/shot               1      1  same
+/shot?max=0         1      1  same
+/selftest           2      1  FASTER
+  one look+check cycle: 2 -> 1 capture(s)   (2x less pixel work)
+  2026-10-27T07:29:54Z shot [1920, 1080] 1204B scaled=True
+  2026-10-27T07:29:54Z shot [1920, 1080] 1204B scaled=False
+  2026-10-27T07:29:55Z shot [1920, 1080] 1204B scaled=True opt=0
+  2026-10-27T07:29:55Z shot [1920, 1080] 1204B scaled=False opt=0
+  2026-10-27T07:29:55Z selftest log-write probe
+
+== OS geometry UNKNOWN  : pixel captures per request (old 1.0.0 vs new 1.0.3) ==
+route             old    new  effect
+/state              1      1  same
+/shot               1      1  same
+/shot?max=0         1      1  same
+/selftest           2      2  same
+  one look+check cycle: 2 -> 2 capture(s)
+
+{
+  "known": {
+    "old": {
+      "version": "1.0.0",
+      "captures": {
+        "/state": 1,
+        "/shot": 1,
+        "/shot?max=0": 1,
+        "/selftest": 2
+      },
+      "errors": {}
+    },
+    "new": {
+      "version": "1.0.3",
+      "captures": {
+        "/state": 0,
+        "/shot": 1,
+        "/shot?max=0": 1,
+        "/selftest": 1
+      },
+      "errors": {}
+    }
+  },
+  "unknown": {
+    "old": {
+      "version": "1.0.0",
+      "captures": {
+        "/state": 1,
+        "/shot": 1,
+        "/shot?max=0": 1,
+        "/selftest": 2
+      },
+      "errors": {}
+    },
+    "new": {
+      "version": "1.0.3",
+      "captures": {
+        "/state": 1,
+        "/shot": 1,
+        "/shot?max=0": 1,
+        "/selftest": 2
+      },
+      "errors": {}
+    }
+  }
+}
