@@ -1,5 +1,18 @@
-# scratch: patch scripts belong in /tmp (see agency F34 — `git add -A` will sweep whatever is lying around)
+# Scratch and runtime artefacts. Kept in one place, deliberately boring:
+#   - a patch script left in the tree WILL be swept into a commit by `git add -A` (F34 in two repos, and
+#     mine cost an F41 merge a stray file), so scratch lives in /tmp or under an ignored name;
+#   - pc-eye writes a log, a readiness marker and a downloaded tunnel binary NEXT TO the code, and a run's
+#     `live/` captures may contain a screenshot of a human's desktop — none of those may ever be committed.
+__pycache__/
+*.pyc
+*.pyo
 tools/_p*.py
 tools/_patch*.py
-**/__pycache__/
-*.pyc
+pceye.log
+*.log
+READY.txt
+cloudflared
+cloudflared.exe
+live/
+.private/
+*.env
