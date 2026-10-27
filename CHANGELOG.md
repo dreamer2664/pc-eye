@@ -169,6 +169,9 @@ First live run on CarloPC. Found and fixed the DPI coordinate split (capture 192
   handler prefers. True headless, false on a real desktop; on `windows-latest` it had been passing solely
   because `FuzzFindings` leaked a `display_rect` stub that ran first in alphabetical order. Now the class pins
   `display_rect` (and restores it), so the assertion is platform-independent.
+- The first attempt pinned only `display_rect`; the `windows-latest` legs then failed with `/act` 409
+  (capture 1920x1080 vs input space 1024x768), so `input_space` is pinned as well — the class now asserts inside
+  one coherent space instead of half-faking one axis of a comparison.
 - `tests/run_ordered.py --isolated`: each class alone in its own process, added to `tests/run_all.py`. It fails a
   test that is green only in company, and it prints the import error instead of eight fake reds when the module
   cannot load (verified both ways, including a deliberately broken import).

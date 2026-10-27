@@ -629,8 +629,12 @@ order the fuzzer ran *before* `Protocol`. Fixing F43 removed the crutch and the 
 same push — which is the correct outcome and the real finding: **the suite was not testing the same thing on
 both platforms, and the bug report that revealed it came from the leak fix, not from a Windows user.**
 
-Fixed by making `Protocol` install the geometry it asserts about (save/restore via `save_seams`), so the
-assertion means the same thing everywhere. Verified by A/B rather than by reading: a `display_rect` that answers
+Fixed by making `Protocol` install the geometry it asserts about (save/restore via `save_seams`) — **both
+seams, not the one I first noticed**: pinning `display_rect` alone made the Windows legs go red a second time,
+with `/act` answering 409 "eyes and hand are in different spaces: /shot returns 1920x1080 but the input calls
+live in 1024x768", because the class then claimed a 1080p desktop to the coordinate gate while `input_space`
+still reported the runner's real 1024x768. Half a fake is worse than none: it makes the two ends of a
+comparison disagree on purpose. `input_space` is pinned too, so the class asserts inside one coherent space. Verified by A/B rather than by reading: a `display_rect` that answers
 like a desktop, with and without the pin — without it `Protocol` fails, with it `Protocol` passes. (Two other
 tests failed under that same simulation; both were the simulation's fault, not the product's — they patch
 `pceye.display_rect` at module level and call it directly, and my override bypassed the cache they assert on.
@@ -647,3 +651,13 @@ Two general rules come out of this, both now enforced rather than advised:
    class's attribute. Every test that wants to steer handler behaviour must patch the class (which is why these
    sites all go through `save_seams`/`restore_seams` now) — and this is the trap the F41 `Launcher` test nearly
    fell into too, from the other side.
+
+Sequence, because it is the part worth keeping: `0d50fd1` (F43+F44 first half) → both `windows-latest` legs red
+with the 409 above → `c33a8f3` added the `display_rect` pin, still red (that commit is where the 409 text comes
+from) → the pin extended to `input_space` here. Verified locally by A/B on a simulated 1024x768 desktop, patched
+onto `pceye.Handler` before `Protocol.setUpClass` runs (patching `pceye.display_rect` at module scope would prove
+nothing, because `Handler.display_rect` is bound to the function object at import — the same trap as rule 2
+above): without the pin 1 of 18 tests fails on the /state assertion, with it all 18 pass. That A/B does *not*
+reproduce the 409 pair — the /act path reads `/shot`'s capture size, which needs the real screen — so the
+Windows legs in CI are the arbiter for those, and the claim here is only that the pin makes the class
+self-consistent, not that a Linux box can emulate a desktop.
