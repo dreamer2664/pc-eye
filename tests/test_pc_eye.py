@@ -960,10 +960,10 @@ class FuzzFindings(unittest.TestCase):
         # plus what they were) scrolls off the end. On the Windows leg this assertion message was the only
         # evidence available and it was useless — a red that cannot be read is a red that cannot be fixed.
         keep = [l for l in (r.stdout or "").splitlines()
-                if re.match(r"^(fuzz |status codes|keep-alive|server-side|hard failures|  !|VERDICT)", l.strip())
-                or "Traceback" in l]
-        self.assertEqual(r.returncode, 0, "\n".join(keep[-14:]) or
-                         f"no report lines; stderr: {(r.stderr or '')[-600:]}")
+                if not re.match(r"^\s*\d{4}-\d\d-\d\dT", l)]      # drop per-request log noise, keep the rest
+        self.assertEqual(r.returncode, 0, ("\n".join(keep[-40:]) or "(no stdout)\n" + (r.stderr or "")[-1500:])
+                         + f"\n  (seed 17, 600 requests; run `python3 evidence/fuzz_protocol.py --requests 600"
+                           f" --seed 17 --trace` for the frames)")
         self.assertIn("hard failures: 0", r.stdout)
         self.assertNotIn(" 500:", r.stdout, "a 500 means an exception escaped the route")
         self.assertIn("server alive after: True", r.stdout)

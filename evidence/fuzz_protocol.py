@@ -227,10 +227,19 @@ def main():
             hard.append("server printed an exception (a client hang-up would be silent): " + line)
     print("keep-alive races (server verified alive after each):", soft)
     print("server-side tracebacks:", len(trace))
-    if trace and a.trace:
-        for l in captured.getvalue().splitlines():
-            if "server.py" in l or re.match(r"^\S*(Error|Exception):", l.strip()):
-                print("   |", l.strip()[:150])
+    if trace:
+        # Print the frames, not just the count. On the windows-latest leg the ONLY thing that mattered was
+        # the exception's own traceback, and it was being reduced to "tracebacks: 33" in the assertion
+        # message — a red that cannot be read is a red that cannot be fixed (third time this shift).
+        lines = captured.getvalue().splitlines()
+        for i, l in enumerate(lines):
+            if re.match(r"^\S*(Error|Exception):", l.strip()):
+                print("   ---")
+                for j in range(max(0, i - 11), i + 1):
+                    print("   |", lines[j].rstrip()[:150])
+    if a.trace:
+        print("---- raw stderr ----")
+        print("\n".join(captured.getvalue().splitlines()[-80:]))
     print("hard failures:", len(hard))
     for h in hard[:12]:
         print("  !", h)
