@@ -6,7 +6,37 @@ Append-only. Correcting an old entry means adding a new one, not editing history
 
 **Whole-process audit + hardening. `AUDIT.md` is the record; this is the summary.**
 26 findings (F1–F26): 6 CRIT, 8 HIGH. Every one is either fixed with a named regression test or reported
-with a recommendation. `evidence/negative_check.py` proves **26 of the 28 new tests fail against 1.0.2**.
+with a recommendation. `evidence/negative_check.py` proves **35 of the 38 new tests fail against 1.0.2**.
+
+### Second pass — a fuzzer, seven more findings, four of them in this release's own code
+
+`evidence/fuzz_protocol.py` generates malformed requests and asserts two absolute properties: the server
+**always answers** (a bad argument is a 400 with a sentence, never a closed socket) and it **prints no
+traceback**. 200,000 requests over five seeds: zero of either. It found F27–F33, recorded in `AUDIT.md`:
+
+* **F27** `/shot?fmt=png&quality=50` raised `UnboundLocalError` inside the handler — `q` existed only in the
+  JPEG arm while the meta dict read it unconditionally. Shipped earlier the same morning, invisible to every
+  hand-written test because each parameter passed alone. Fixed: quality resolves once for both formats.
+* **F28** `{"x": true}` clicked pixel 1 (`isinstance(True, int)` is true in Python). A bool is now refused
+  as a bool, everywhere.
+* **F29** `{"x": 3.5}` was silently truncated to 3. Fractional coordinates are refused; `3.0` still works.
+* **F30** JSON `1e999` (Infinity) reached `int()` → `OverflowError` escaped on four routes. Finiteness is
+  checked before any conversion, and the ordering is commented because `f != int(f)` on infinity *is* the crash.
+* **F31** the optional knobs (`clicks`, `times`, `seconds`, `interval`) were never parsed at all:
+  `clicks:"three"` raised inside the Windows branch, `interval:3600` slept an hour per character,
+  `clicks:1e309` went to the OS as a wheel delta. `strict_int()` parses them at the door.
+* **F32** `ctrl++` dropped the empty part and pressed `ctrl`. A half-typed chord is now refused, with the
+  correct spelling in the message — something-else is worse than nothing.
+* **F33** a peer that hangs up mid-write (pull-to-refresh, `curl --max-time`, a proxy giving up) killed the
+  handler thread and printed a `BrokenPipeError` for a non-event. `_write()` swallows exactly those two
+  exceptions and nothing else, so a traceback that *does* appear still means a bug.
+
+`scroll clicks:0` used to answer `ok:true` having moved nothing (a legal JSON `1e-999` underflows to 0).
+Refused now — the same `ok`-shaped lie as F2, arriving from a completely different direction.
+
+Two of the fixes introduced their own bug and were caught by the same machinery (documented in `AUDIT.md`):
+a finiteness guard that called `float()` on a huge int, and a whole-number test that compared a value with
+its own truncation. Suite 67 → 77; the negative control now runs 38 tests against 1.0.2 and 35 go red.
 
 ### A confident lie became a refusal
 * **F1** `/act` now **stops** when the eyes and the hand are in different coordinate spaces (the prose

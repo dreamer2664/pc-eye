@@ -365,3 +365,35 @@ Filed as a design note rather than a fix so nobody ships an untested pixel asser
 | F26 | LOW | exact:true proves the pointer, not the outcome | documented as a note |
 
 Independent non-owner acceptance remains **PENDING**.
+
+---
+
+## Second pass — the fuzzer (F27–F33), found after the first 20 were already "done"
+
+`evidence/fuzz_protocol.py` generates 4,000 malformed requests per run and asserts two absolute properties:
+the server **always answers**, and it **never prints a traceback**. It found seven. Four were in code I had
+written the same morning, which is the entire argument for running a generator instead of a checklist.
+
+| # | sev | finding | status |
+|---|---|---|---|
+| F27 | CRIT | `Screen.grab()` referenced the JPEG-only variable `q` in its meta dict, so **`/shot?fmt=png&quality=50` raised `UnboundLocalError` and the connection died**. Shipped in 1.0.3, by me, that morning. Each parameter passed alone; only the pair was fatal. | fixed: quality resolved once for both formats; the fake screen now echoes the `fmt` it was asked for, so a route that ignores it cannot pass |
+| F28 | HIGH | `num()` accepted `True`/`False` as coordinates because `isinstance(True, int)` is true in Python — `{"x": true}` clicked pixel 1. | fixed: a bool is refused as a bool |
+| F29 | HIGH | `{"x": 3.5}` was silently truncated to 3. A coordinate rounded in the dark is how you end up a pixel off a scrollbar and swear you clicked it. | fixed: fractional coordinates refused; `3.0` still accepted |
+| F30 | CRIT | JSON `1e999` (Infinity) reached `int()` → `OverflowError` escaped the handler on four routes (`x`, `clicks`, `times`, `region`). Neither 1.0.2 nor my first pass caught it: the agent saw a dead PC. | fixed: finiteness checked before any conversion; the ordering is commented because `f != int(f)` on infinity *is* the crash |
+| F31 | MED | the optional knobs (`clicks`, `times`, `seconds`, `interval`) were never parsed at all: `clicks:"three"` raised inside the Windows branch, `interval:3600` slept an hour per character, `clicks:1e309*120` went to the OS as a wheel delta. | fixed: `strict_int()` parses them at the door with the same strictness as coordinates |
+| F32 | MED | `ctrl++` and `ctrl+` dropped the empty part and pressed `ctrl` — a half-typed chord doing something else is worse than a refusal. | fixed: refused, with the correct spelling in the message |
+| F33 | LOW | a peer that hangs up mid-write (pull-to-refresh, `curl --max-time`, a proxy giving up) killed the handler thread and printed a `BrokenPipeError` traceback for a non-event. | fixed: `_write()` swallows exactly `BrokenPipeError`/`ConnectionResetError`, nothing else |
+
+Two process lessons, recorded because they generalise:
+
+* **A test that passes on the broken code is worse than no test.** `test_state_does_not_grab_the_screen`
+  passed on 1.0.2 because the fake provided the method the bug was in. Same for the fake screen always
+  answering `image/jpeg` regardless of `?fmt=` — it hid F27 from the suite. Fakes must be as strict as the
+  thing they replace, or they are decoration.
+* **Never hardcode a port in a test.** The launcher tests asserted `43791` exactly and went red whenever any
+  other process (mine, from a killed command) held `43790`. They now bind an OS-assigned port and assert the
+  *contract* — moved up, inside the window, hop count reported — not the free-port lottery.
+
+`scroll clicks:0` used to answer `ok:true` having moved nothing (a legal JSON `1e-999` underflows to 0). It
+is now refused: an action that does nothing must not look like an action that succeeded — the same
+`ok`-shaped lie as F2, arriving from a completely different direction.

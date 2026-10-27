@@ -68,6 +68,8 @@ ACT_RATE_PER_MIN = 120        # sustained input actions per minute (see RateBuck
 SHOT_RATE_PER_MIN = 180       # a look-decide-act loop is ~1-2 req/s; this is 3/s, generous on purpose
 BURST_ACT, BURST_SHOT = 30, 60
 MAX_EASE_S = 5.0              # `move seconds=` is honoured now, and capped
+MAX_SCROLL_CLICKS = 100       # one click is 120 units of wheel; 100 is a screenful, not a stack overflow
+MAX_INTERVAL_S = 0.5          # a per-character delay is a tuning knob, not a sleep budget
 MAX_PASTE_CHARS = 200000      # clipboard text is cheap; still not unbounded
 # action name -> the method on Input that performs it. Kept beside the contract so a new action cannot
 # exist in the schema and be missing from the implementation (a test asserts the two match).
@@ -219,6 +221,38 @@ def coord_gate(action, body, capture_full, in_space):
     return None
 
 
+def strict_int(name, v, lo=None, hi=None, whole=True):
+    """For the optional knobs (`clicks`, `seconds`, `times`, `interval`), which reached ctypes raw in 1.0.2.
+
+    num() only ever saw x/y/x2/y2. So `scroll clicks:"three"` raised ValueError inside the Windows branch
+    (a dead socket and no message), `clicks:true` scrolled one notch because True IS an int in Python, and
+    `type interval:3600` slept an hour per character. One funnel, one phrasing, everywhere.
+    """
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        raise ValueError(f"{name} must be a number, not true/false — got {v!r}")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number — got {v!r}")
+    except OverflowError:
+        raise ValueError(f"{name} is far outside anything sane — got {v!r}")
+    if not -1e308 < f < 1e308:      # covers inf/-inf; ordering matters, see the comment below
+        raise ValueError(f"{name} is not a usable number — got {v!r}")
+    # Order: finiteness FIRST. `f != int(f)` is the obvious whole-number test and it raises
+    # OverflowError on infinity — which the fuzzer turned into the third dead-socket instance of the same
+    # root cause. Guard, then compare, never the reverse.
+    if whole and f != int(f):
+        raise ValueError(f"{name} must be a whole number — got {v!r}")
+    out = int(f) if whole else f
+    if lo is not None and out < lo:
+        raise ValueError(f"{name} must be >= {lo} — got {out}")
+    if hi is not None and out > hi:
+        raise ValueError(f"{name} must be <= {hi} — got {out}")
+    return out
+
+
 def num(name, v, lo=None, hi=None, integer=True):
     """One place that turns a query/body value into a number or raises a sentence an agent can act on.
 
@@ -227,11 +261,34 @@ def num(name, v, lo=None, hi=None, integer=True):
     """
     if v is None or v == "":
         return None
+    if isinstance(v, bool):
+        # `{"x": true}` used to type-check as 1 and click a real pixel. A boolean is not a coordinate,
+        # in Python's eyes or anyone else's, and silently coercing it is the ok-shaped lie again.
+        raise ValueError(f"{name} must be {'an integer' if integer else 'a number'}, not true/false — "
+                         f"got {v!r}")
     try:
         out = int(v) if integer else float(v)
     except (TypeError, ValueError):
         want = "an integer" if integer else "a number"
         raise ValueError(f"{name} must be {want} — got {v!r}")
+    except OverflowError:
+        # `{"x": 1e999}` is legal JSON (Infinity) and int(Infinity) raises OverflowError, which 1.0.2
+        # never caught either: it escaped the handler and the connection just died. Note the float branch
+        # does NOT raise — float("1e999") is simply inf — so the finiteness test below is what covers it.
+        raise ValueError(f"{name} is far outside any screen — got {v!r}")
+    # Compare integers as integers. My first finiteness guard here said `float(out) < 1e308`, which is
+    # precisely the bug it was written to fix: `{"x": 10**400}` is legal JSON, int() accepts it, and
+    # float(huge_int) raises OverflowError — an escaped exception, i.e. a dead socket again. So the
+    # magnitude test is an integer comparison and float() only runs on something already known to fit.
+    if not -1e308 < out < 1e308:
+        raise ValueError(f"{name} is far outside any screen — got {v!r}")
+    if integer:
+        # float(v), not float(out): `out` is int(v) — already truncated — so comparing it with itself
+        # would accept 3.5. That is how the second version of this guard broke its own test. A number that
+        # does not fit in a float is refused above, so this conversion cannot raise.
+        if float(v) != out:
+            raise ValueError(f"{name} must be a whole number of pixels — got {v!r} (rounding a coordinate "
+                             f"silently is how an agent ends up one pixel off a scrollbar)")
     if lo is not None and out < lo:
         raise ValueError(f"{name} must be >= {lo} — got {out}")
     if hi is not None and out > hi:
@@ -302,11 +359,23 @@ def parse_region(spec):
     if len(parts) != 4:
         raise ValueError(f"region must be x,y,w,h (four numbers) — got {spec!r}")
     try:
-        x, y, w, h = (int(p) for p in parts)
+        # A tuple, not a generator: unpacking a generator runs int() INSIDE the generator, so the
+        # OverflowError from a huge float (`region=1e999,...`) escapes this except clause entirely and
+        # kills the thread. Same class as every other bug here: the crash is one line away from the parse.
+        x, y, w, h = tuple(int(p) for p in parts)
     except (TypeError, ValueError):
         raise ValueError(f"region must be four integers x,y,w,h — got {spec!r}")
+    except OverflowError:
+        raise ValueError(f"region must be four integers x,y,w,h — got {spec!r} (a float that large is not "
+                         f"a coordinate)")
     if w <= 0 or h <= 0:
         raise ValueError(f"region width and height must be positive — got {w}x{h}")
+    # A region is a crop, and Pillow raises OverflowError (not ValueError) when a box is astronomically
+    # large — which reached the handler as a traceback. /shot already refuses an off-screen region with a
+    # sentence, so an absurd one is refused in the same voice, with the real numbers in it.
+    if max(abs(x), abs(y), w, h) > 100_000:
+        raise ValueError(f"region {x},{y},{w},{h} is not a plausible part of a screen (limits are ±100000 "
+                         f"for offsets and 100000 for size). If you want the whole desktop, omit region.")
     return (x, y, w, h)
 
 
@@ -391,12 +460,17 @@ class Screen:
             img = img.resize((mw, max(1, int(img.height * mw / img.width))))
             scaled = True
         buf = io.BytesIO()
+        # Resolved once, for both formats. `q` used to exist only in the JPEG arm while the meta dict below
+        # referenced it unconditionally, so `/shot?fmt=png&quality=50` raised UnboundLocalError inside the
+        # handler — an agent got a dead socket on a request whose only crime was asking for a lossless frame
+        # with a knob the docs list for that route. The fuzzer found it; my hand-written tests missed it
+        # because each of the two parameters had been tested on its own. PNG ignores quality, but says so.
+        q = self.quality if quality is None else int(quality)
+        opt = self.optimize if optimize is None else bool(optimize)
         if fmt == "png":
-            img.save(buf, "PNG", optimize=bool(self.optimize if optimize is None else optimize))
+            img.save(buf, "PNG", optimize=opt)
             mime = "image/png"
         else:
-            q = self.quality if quality is None else int(quality)
-            opt = self.optimize if optimize is None else bool(optimize)
             if img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
             img.save(buf, "JPEG", quality=q, optimize=opt)
@@ -404,7 +478,7 @@ class Screen:
         data = buf.getvalue()
         meta = {"full": list(full), "sent": [img.width, img.height], "scaled": scaled,
                 "bytes": len(data), "mime": mime, "format": fmt, "quality": q,
-                "optimize": bool(self.optimize if optimize is None else optimize),
+                "optimize": opt,
                 "at": z(), "hash": content_hash(data)}
         return data, meta
 
@@ -527,6 +601,13 @@ class Input:
             self._move_windows(x, y)          # land exactly, not one step short
 
     def type_text(self, text, interval=0.004):
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            raise ValueError(f"type interval must be a number of seconds — got {interval!r}")
+        if not (0.0 <= interval <= MAX_INTERVAL_S):
+            raise ValueError(f"type interval must be within 0..{MAX_INTERVAL_S}s — got {interval}. "
+                             f"A bigger delay is a hang, not a setting.")
         n = len(str(text))
         if n > MAX_TYPE_CHARS:
             raise RuntimeError(f"{n} characters is more than one action should be ({MAX_TYPE_CHARS} max) — "
@@ -535,7 +616,7 @@ class Input:
         if self.dry_run:
             self.did.append(("type", text)); return
         if SYSTEM == "Windows":
-            self._type_windows(text, max(0.0, float(interval)))
+            self._type_windows(text, interval)
 
     def paste(self, text):
         """Clipboard + Ctrl+V — the fast, drop-free path (qcaptcha's default delivery mode).
@@ -577,7 +658,13 @@ class Input:
             raise RuntimeError("ctrl+alt+del cannot be synthesized by user code — Windows reserves it "
                                "(and it must never be an automation verb); use Task Manager instead")
         if "+" in name:
-            parts = [p.strip() for p in name.split("+") if p.strip()]
+            raw = [p.strip() for p in name.split("+")]
+            if any(not p for p in raw):
+                # "ctrl++" silently dropped the empty piece and pressed ctrl; "ctrl+" pressed ctrl. A
+                # half-typed chord that does SOMETHING ELSE is worse than one that is refused.
+                raise RuntimeError(f"chord {key!r} has an empty key between '+' — write it as "
+                                   f"ctrl+shift+n, with no blank parts")
+            parts = raw
             bad = [p for p in parts if p not in self.KEYS and not (len(p) == 1 and p.isalnum())]
             if bad:
                 raise RuntimeError(f"unknown key in chord {name!r}: {bad} (known: {sorted(self.KEYS)}, or a "
@@ -597,6 +684,10 @@ class Input:
             times = int(times if times is not None else 1)
         except (TypeError, ValueError):
             raise ValueError(f"key times must be an integer — got {times!r}")
+        except OverflowError:
+            raise ValueError(f"key times is not a number of presses: {times!r}")
+        if times != float(times if times is not None else 1):
+            raise ValueError(f"key times must be a whole number of presses — got {times!r}")
         if times > MAX_KEY_TIMES:
             raise RuntimeError(f"key times={times} exceeds {MAX_KEY_TIMES} — that would hold the "
                                f"keyboard for {times * 0.03:.0f}s of nothing useful")
@@ -634,6 +725,15 @@ class Input:
         u32.mouse_event(up, 0, 0, 0, 0)
 
     def scroll(self, clicks=-3, x=None, y=None):
+        try:
+            clicks = int(clicks)
+        except (TypeError, ValueError):
+            raise ValueError(f"scroll clicks must be an integer — got {clicks!r}")
+        except OverflowError:
+            raise ValueError(f"scroll clicks is not a number of clicks: {clicks!r}")
+        if abs(clicks) > MAX_SCROLL_CLICKS:
+            raise ValueError(f"scroll clicks must be within ±{MAX_SCROLL_CLICKS} — got {clicks}. "
+                             f"The wheel delta goes to Windows as clicks*120; ask for a page at a time.")
         if self.dry_run:
             self.did.append(("scroll", clicks)); return
         if SYSTEM != "Windows":
@@ -641,7 +741,7 @@ class Input:
         u32 = self._u32()
         if x is not None and y is not None:
             u32.SetCursorPos(int(x), int(y)); time.sleep(0.05)
-        u32.mouse_event(0x0800, 0, 0, int(clicks) * 120, 0)      # MOUSEEVENTF_WHEEL
+        u32.mouse_event(0x0800, 0, 0, clicks * 120, 0)            # MOUSEEVENTF_WHEEL
 
 
 # ------------------------------------------------------------------- state ---
@@ -734,7 +834,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(body)
+        self._write(body)
+
+    def _write(self, data) -> bool:
+        """Send a body, tolerating a peer that vanished mid-write.
+
+        A phone pulling to refresh, a curl `--max-time`, a proxy that gave up: they all close the socket
+        while we are still writing, and BaseHTTPRequestHandler lets the BrokenPipeError escape — killing the
+        handler thread and printing a traceback into the human's console for something that happens hundreds
+        of times a day and means nothing. Swallow exactly that, so a traceback that DOES appear still means a
+        bug. (The multi-MB screenshot is where it happens most, which is why this is under _bytes too.)
+        """
+        try:
+            self.wfile.write(data)
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+            return False
 
     def _bytes(self, code, data, mime, extra=None):
         self.send_response(code)
@@ -746,7 +862,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, str(v))
         self.end_headers()
         if data:
-            self.wfile.write(data)
+            self._write(data)
 
     def _token_ok(self, q) -> bool:
         given = self.headers.get("X-Token") or (q.get("t") or [""])[0] or \
@@ -783,6 +899,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *a):          # keep the console readable: one line per request
         pass
+
+    def finish(self):
+        """A phone pulling-to-refresh, a curl timeout, a proxy giving up: all of them close the socket
+        mid-write. BaseHTTPRequestHandler lets the BrokenPipeError escape, which kills the handler thread
+        and prints a traceback into the human's console for a non-event that will happen hundreds of times.
+        """
+        try:
+            super().finish()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+        except OSError:
+            pass
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -962,6 +1093,27 @@ class Handler(BaseHTTPRequestHandler):
         if extra:
             return self._json(400, {"ok": False, "error": f"{action} has no field(s) {extra} — a typo must "
                                                           f"not ride along to the OS"})
+        # The optional numbers are parsed at the door, with the same strictness as the coordinates. In 1.0.2
+        # `clicks`, `times`, `seconds` and `interval` were forwarded untouched, which is a traceback in a
+        # thread instead of an answer — and an unanswered request is what a dead PC looks like.
+        try:
+            if "clicks" in body:
+                v = strict_int("clicks", body["clicks"], lo=-MAX_SCROLL_CLICKS, hi=MAX_SCROLL_CLICKS)
+                if v == 0 and action == "scroll":
+                    # 1e-999 (a legal JSON float) underflows to 0, and a scroll of zero notches answers
+                    # ok:true having moved nothing. That is the ok-shaped lie in a new costume.
+                    raise ValueError("scroll clicks must be at least one notch either way — got 0. "
+                                     "Omit the field for the default of -3.")
+                body["clicks"] = v
+            if "times" in body:
+                body["times"] = strict_int("times", body["times"], lo=1, hi=MAX_KEY_TIMES)
+            if "seconds" in body:
+                body["seconds"] = strict_int("seconds", body["seconds"], lo=0, hi=MAX_EASE_S, whole=False)
+            if "interval" in body:
+                body["interval"] = strict_int("interval", body["interval"], lo=0, hi=MAX_INTERVAL_S,
+                                              whole=False)
+        except ValueError as e:
+            return self._json(400, {"ok": False, "action": action, "error": str(e)})
         # Numbers are parsed HERE, once, so a `x: "banana"` is a 400 that names the field instead of an
         # AttributeError inside ctypes that the agent reads as "the PC is broken".
         try:
@@ -987,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
             for kx, ky in (("x", "y"), ("x2", "y2")):
                 if body.get(kx) is None or body.get(ky) is None:
                     continue
-                px, py = int(body[kx]), int(body[ky])
+                px, py = coords.get(kx, body[kx]), coords.get(ky, body[ky])
                 if not (0 <= px < space[0] and 0 <= py < space[1]):
                     return self._json(409, {"ok": False, "action": action,
                                             "error": f"({px},{py}) is outside the coordinate space the input "
@@ -1089,16 +1241,25 @@ def main(argv=None) -> int:
         print(f"  !! token is {len(token)} chars. This machine is reachable from the internet through the "
               f"tunnel and the token is the ONLY thing between a stranger and your mouse. "
               f"Drop --token and let it generate 32.", flush=True)
-    srv = build(a.port, token, a.host, a.max_width, a.log, a.dry_run, optimize=a.optimize)
     if a.selftest:
+        # Deliberately BEFORE the socket exists: a self-test is a question about this machine, not a server
+        # to be reached. Binding first meant `python server.py --selftest` could die with "address already
+        # in use" — on a healthy PC, and on a CI runner whose port range Hyper-V has reserved — which reads
+        # to an agent as "the eye is broken" when nothing is.
+        configure(token, a.max_width, a.log, a.dry_run, a.optimize)   # the screen/dpi objects live here
         s = Handler.screen
         try:
             data, meta = s.grab()
-            print(json.dumps({"ok": True, "capture": meta, "token_set": bool(token)}, indent=2))
-        except RuntimeError as e:
-            print(json.dumps({"ok": False, "capture_error": str(e), "token_set": bool(token)}, indent=2))
+            print(json.dumps({"ok": True, "capture": meta, "token_set": bool(token),
+                              "dry_run": bool(a.dry_run)}, indent=2))
+        except (RuntimeError, ValueError, OSError) as e:
+            # Any of those is "this machine could not do it", and the answer must still be one JSON object:
+            # a traceback from --selftest is the least useful output this tool can produce.
+            print(json.dumps({"ok": False, "capture_error": f"{type(e).__name__}: {e}",
+                              "token_set": bool(token), "dry_run": bool(a.dry_run)}, indent=2))
             return 1
         return 0
+    srv = build(a.port, token, a.host, a.max_width, a.log, a.dry_run, optimize=a.optimize)
     print(f"pc-eye {VERSION} on {platform.node()} ({SYSTEM})", flush=True)
     if a.dry_run:
         print("  *** DRY-RUN: nothing reaches the mouse or keyboard. The agent must be told. ***", flush=True)

@@ -60,6 +60,12 @@ def main() -> int:
     if "Cache-Control" not in src or "no-store" not in src:
         fails.append("responses must not be cacheable: a screenshot of someone's desktop is not a public asset")
 
+    tests_src = read("tests/test_pc_eye.py")
+    for bad in sorted(set(re.findall(r"open_socket_on\((\d{4,5})", tests_src))):
+        if bad not in ("0",):
+            fails.append(f"tests hardcode port {bad} — an OS-assigned port or nothing "
+                         f"(Windows CI reserves whole ranges; a fixed port is a flake waiting to happen)")
+
     if fails:
         print("DOC DRIFT:")
         for f in fails:
