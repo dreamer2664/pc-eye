@@ -31,6 +31,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
+try:                                                      # a cp1252 console must not kill the soak
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+except (AttributeError, ValueError):
+    pass
 import server as pceye                                    # noqa: E402
 from PIL import Image                                       # noqa: E402
 

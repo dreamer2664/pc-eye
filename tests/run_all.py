@@ -22,9 +22,16 @@ ROOT = HERE.parent
 
 def run(cmd):
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, errors="replace")
+    # encoding="utf-8" because on Windows text=True means "decode with cp1252", and our own log lines
+    # contain em-dashes: the harness would mangle or die on the output of a perfectly healthy run.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, errors="replace",
+                       encoding="utf-8", env=env)
     out = (r.stdout or "") + "\n" + (r.stderr or "")
     return r.returncode, round(time.time() - t0, 1), out
+
+
+MAX_BLOCKS = 40        # never more than this, but never FEWER than the failures either
 
 
 def report(out, full=False):
@@ -46,12 +53,14 @@ def report(out, full=False):
     else:                                   # no failure names: show everything, something is wrong
         keep = ["\n".join(lines[-12:])]
     summary = [l for l in lines if re.match(r"^(Ran |OK|FAILED|SKIPPED|VERDICT|\d+/\d+)", l.strip())]
-    body = keep if full or len(keep) <= 6 else keep[:6]
+    body = keep if full or len(keep) <= MAX_BLOCKS else keep[:MAX_BLOCKS]
     for b in body:
         for l in b.splitlines():
             print(f"      {l}")
-    if len(names) > 6:
-        print(f"      … {len(names) - 6} more (run with --full)")
+    if len(names) > MAX_BLOCKS:
+        print(f"      … {len(names) - MAX_BLOCKS} more blocks suppressed (run with --full)")
+    if len(names) > len(body):            # always list the names, even past the block cap
+        print("      failing: " + "; ".join(n.split(" ")[1] for n in names))
     shown = "\n".join(body)
     for l in summary[-3:]:
         if l.strip() not in shown.splitlines():      # do not print the same line twice

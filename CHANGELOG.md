@@ -38,6 +38,17 @@ Two of the fixes introduced their own bug and were caught by the same machinery 
 a finiteness guard that called `float()` on a huge int, and a whole-number test that compared a value with
 its own truncation. Suite 67 → 77; the negative control now runs 38 tests against 1.0.2 and 35 go red.
 
+### The windows-latest leg earned its keep (F35–F38)
+
+First run red with 5 failures while Linux was green. Three were my *tests* being wrong about Windows
+(asserting `input_space() is None`, assuming ephemeral ports come in adjacent runs, decoding a healthy
+child's em-dashes as cp1252), and one was a real defect: `build(port, …, sock=)` orphaned a socket, because
+`ThreadingHTTPServer(bind_and_activate=False)` still runs `server_bind()` and replaces `self.socket` —
+reported by `-X dev` as a ResourceWarning, and by CI as `PYTHONWARNINGS=error::ResourceWarning`. Now the
+pre-bound socket is installed before activation, and `server.py`/the harnesses force UTF-8 with
+`backslashreplace`, because a `print()` that raises `UnicodeEncodeError` inside a handler is indistinguishable
+from a crashed eye on the one platform where the console codepage is not UTF-8.
+
 ### Housekeeping a merge should not have to mention
 
 `start.sh` had lost its executable bit in a snapshot/restore cycle (it is 100755 upstream, which `git ls-tree`

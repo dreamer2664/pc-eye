@@ -132,6 +132,10 @@ traceback** (a human's console full of fake bugs is how a real one gets ignored)
 
     python3 evidence/fuzz_protocol.py --requests 4000        # ~3s, no display, no mouse, --dry-run
 
+Every log line is UTF-8-forced with `backslashreplace`, on purpose: a Windows console opened by
+`start.bat` is cp1252/cp437, and one em-dash in a `print()` inside a handler is a dead thread, i.e. a dead
+eye, for a formatting reason. Do not "simplify" that back to `print(..., flush=True)`.
+
 `python3 tests/run_all.py --all` runs the suite, `tools/check_docs.py` (docs may not drift from the code),
 the capture counter, and the negative control — which hosts these very tests against the pre-fix `server.py`
 and reports how many go red **without** the fix (38 run, 35 red). A suite that only passes on the new code

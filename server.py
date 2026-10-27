@@ -55,6 +55,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 VERSION = "1.0.3"
+
+# The Windows console a double-clicked start.bat opens is cp1252 (sometimes cp437). One em-dash in a log
+# line — and every log line here has several — raises UnicodeEncodeError inside print(), which kills the
+# handler thread and looks exactly like a crash of the eye. Reconfiguring the streams is the whole fix, and
+# it is the reason this line is above the definitions rather than inside main(): the launcher imports this
+# module before it prints anything.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass                       # captured/foreign streams (pytest, IDLE): their owner sets the encoding
 SYSTEM = platform.system()
 DEFAULT_PORT = 8790
 # The whole product is "look, decide, act, look again" — so the limits below exist to keep a
@@ -1215,8 +1226,17 @@ def build(port: int, token: str, host: str = "127.0.0.1", max_width: int = 1440,
           log_path: str = "pceye.log", dry_run: bool = False, optimize: bool = False, sock=None):
     cls = configure(token, max_width, log_path, dry_run, optimize)
     if sock is not None:                       # pre-bound: ThreadingHTTPServer will not bind again
+        # `server_bind()` is called even with bind_and_activate=False, and it REPLACES self.socket with a
+        # fresh unbound one. So hand it our socket first: otherwise every pre-bound run leaks a socket,
+        # which `-X dev` reports as "Exception ignored in: <socket.socket …> ResourceWarning: unclosed".
+        # Harmless on Linux, an error under the CI leg's PYTHONWARNINGS=error::ResourceWarning.
         srv = ThreadingHTTPServer((host, port), cls, bind_and_activate=False)
-        srv.socket = sock
+        if srv.socket is not sock:
+            try:
+                srv.socket.close()
+            except OSError:
+                pass
+            srv.socket = sock
         srv.server_activate()
         return srv
     return ThreadingHTTPServer((host, port), cls)
