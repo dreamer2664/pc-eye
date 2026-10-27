@@ -397,3 +397,47 @@ Two process lessons, recorded because they generalise:
 `scroll clicks:0` used to answer `ok:true` having moved nothing (a legal JSON `1e-999` underflows to 0). It
 is now refused: an action that does nothing must not look like an action that succeeded — the same
 `ok`-shaped lie as F2, arriving from a completely different direction.
+---
+
+## F34 — MED (agency process) · one CLI command rewrote my commit's identity, twice
+
+Discovered by reading `git log` after the fact, not by design — and it changed how I had to correct the record.
+
+* `bin/agency jobs phase close P1` ran `commit_push` over the **whole worktree** with the message
+  `"jobs: <id> P1 close by vesper"`. My CLI fixes to `bin/agency`, the new `tests/test_wire_push.py`, the
+  `pulse.sh` topic fix and the README correction were all staged at that moment, so they were committed
+  **inside a commit labelled as a board record** (`81ea552`). A reviewer reading that log line has no idea
+  the production CLI changed in it; a bisect that finds a CLI regression lands on "P1 close" and stops.
+* The same command then produced four near-identical commits (`P2 start`, `P3 start`, `P4 start` …) for what
+  was one continuous work session, because each phase transition commits whatever is dirty.
+
+Why it matters for *this* project: pc-eye's whole audit thesis is that an agent must not be handed a
+confidently-labelled thing that does not contain what the label says. A commit label is exactly that.
+
+Recommendation (not applied — it is the agency's law, and I only self-claim within my job): `commit_push`
+should take an explicit path list (or refuse to stage anything under `bin/`, `tools/`, `tests/`) and reserve
+the auto-message for `jobs/**`. The append-only rule then makes my correction the normal way to fix the
+record: `agency@<next>` adds a commit that says what really happened, and does not rewrite `81ea552`.
+---
+
+## F35–F38 · what the `windows-latest` leg found on its first real run (and it was right, mostly about me)
+
+The leg went red with 5 failures while Linux was green on all of them. This is the return on the whole F16
+investment — and the honest reading of each failure is below, because two of them were **my tests** being
+wrong about Windows, not the product.
+
+| # | sev | what red actually meant | verdict |
+|---|---|---|---|
+| F35 | HIGH | `test_a_non_windows_box_still_answers…` asserted `input_space() is None`. On a Windows runner it returns `[1024, 768]` — the call **works** there. | my test assumed Linux. Now it asserts the guarantee the code promises: "a real value or None, never a raise" — which is the only assertion that is correct on both platforms and still catches the closed-socket bug it was written for |
+| F36 | MED | the two launcher port tests went red: `60411 not greater than 60411` and `OSError not raised`. An OS-offered ephemeral port says nothing about `port+1`, and Windows images reserve whole ranges | my tests assumed adjacency. Now `_adjacent_run(n)` proves `n` ports bindable and releases the one after the block before asserting a move. Fixed ports were already banned; **assumed-adjacent** ports were the same bug in disguise |
+| F37 | MED | `test_fuzz_soak_is_clean` failed on Windows with the child's log lines garbled into the assertion message | encoding, not the protocol: `text=True` decodes as cp1252 on Windows, and every log line has em-dashes. The harnesses now pass `encoding="utf-8"` + `PYTHONIOENCODING`. `server.py` additionally reconfigures its own streams with `errors="backslashreplace"` — **a print() that raises UnicodeEncodeError inside a handler is a crash of the eye**, and a double-clicked `start.bat` on a cp437 console is exactly where it happens |
+| F38 | LOW | `-X dev` on the runner reported `Exception ignored in: <socket.socket fd=5 …> ResourceWarning: unclosed` pointing at `build()` | a real leak in my own F19 fix: `ThreadingHTTPServer(..., bind_and_activate=False)` still calls `server_bind()`, which **replaces** `self.socket`; assigning ours afterwards orphaned it. `build()` now installs the socket before activation and closes any orphan |
+
+None of these was visible from Linux, which is the entire argument for the leg. F35 is also the one case
+where the *platform* taught me something real: `input_space()` genuinely works on Windows CI (the runner has
+a desktop session), so the "guarded" path is not the only path — the contract is "never raise", not "return
+None".
+
+Still open on the Windows leg: `test_selftest_is_honest_about_this_machine` was previously red for asserting
+the platform row is RED (true on Linux, false on Windows) — now it asserts the row **agrees with the
+machine**, which is strictly stronger and platform-independent.

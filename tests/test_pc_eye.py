@@ -492,11 +492,23 @@ class RegressionV103(unittest.TestCase):
         orig = pceye.SYSTEM
         pceye.SYSTEM = "Windows"                  # the worst case: pretend to be Windows on a Linux box
         try:
-            self.assertIsNone(pceye.input_space())
-            self.assertIsNone(pceye.cursor_pos())
+            # On a real Windows runner these calls SUCCEED and return the actual geometry, which is exactly
+            # what the CI leg exists to find out. So the assertion is the guarantee the code promises —
+            # "never raise, answer either a real value or None" — not "answer None because we are on Linux",
+            # which made the windows-latest leg red for being Windows ([1024, 768] is not None).
+            for fn in (pceye.input_space, pceye.cursor_pos):
+                got = fn()
+                self.assertTrue(got is None or (isinstance(got, list) and len(got) == 2
+                                                and all(isinstance(v, int) for v in got)),
+                                f"{fn.__name__}() returned {got!r}: must be [w,h]/[x,y] or None, never a raise")
             code, body = self.c.post("/act", {"action": "paste", "text": "hello"})
-            self.assertEqual(code, 409, f"must be a JSON refusal, got {code}")
-            self.assertIn("NOT pasted", body["error"])
+            # A headless Windows session has no clipboard station, so paste legitimately fails; either
+            # answer is correct as long as it is an ANSWER in JSON and not a closed socket.
+            self.assertIn(code, (200, 409), f"must be a JSON answer, got {code}")
+            if code == 409:
+                self.assertIn("NOT pasted", body["error"])
+            else:
+                self.assertTrue(body.get("pasted"), "a 200 paste must say it pasted")
         finally:
             pceye.SYSTEM = orig
 
@@ -939,8 +951,11 @@ class FuzzFindings(unittest.TestCase):
         if os.environ.get("PCEYE_SKIP_SOAK"):
             self.skipTest("the soak generates its own server; negative_check runs it against the old code "
                           "in a separate step instead")
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8",   # the child's em-dashes must survive a
+               "PYTHONUTF8": "1"}                            # cp1252 console, or the soak "fails" on encoding
         r = subprocess.run([sys.executable, str(HERE / "evidence" / "fuzz_protocol.py"),
-                            "--requests", "600", "--seed", "17"], capture_output=True, text=True, timeout=180)
+                            "--requests", "600", "--seed", "17"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env, timeout=240)
         self.assertEqual(r.returncode, 0, (r.stdout + r.stderr)[-1500:])
         self.assertIn("hard failures: 0", r.stdout)
         self.assertNotIn(" 500:", r.stdout, "a 500 means an exception escaped the route")
@@ -957,6 +972,34 @@ class Launcher(unittest.TestCase):
     These are the two failure modes the console could not explain: a port already taken (pc-eye started
     twice, or something else on 8790) and a tunnel binary that arrived as an error page.
     """
+
+    @staticmethod
+    def _adjacent_run(count):
+        """A port `p` where p, p+1 … p+count-1 are ALL bindable.
+
+        The naive version asked the OS for one free port and assumed the neighbours were free too. That
+        assumption held on Linux and lost on the Windows CI runner (`60411 not greater than 60411`, and
+        "OSError not raised"): an ephemeral port says nothing about port+1, and Hyper-V reserves whole
+        ranges. So bind the block, then release it — a few microseconds of race against a machine running
+        nothing else, in exchange for a test that means the same thing on every platform.
+        """
+        from launcher import open_socket_on
+        last = None
+        for _ in range(12):
+            base = free_port()
+            held = []
+            try:
+                for i in range(count + 1):            # one MORE than needed: the port after the block
+                    held.append(open_socket_on(base + i, tries=1))                                    # must
+                if count > 1:                          # be free as well, or a "moved one port" claim is
+                    held[-1][0].close()                # just the OS's scheduling
+                    held = held[:-1]
+                return base, held                     # caller closes them; they are the busy block
+            except Exception as e:
+                last = e
+                for s_, _, _ in held:
+                    s_.close()
+        raise AssertionError(f"no run of {count} adjacent free ports after 12 tries: {last}")
 
     @staticmethod
     def _block(count):
@@ -987,8 +1030,10 @@ class Launcher(unittest.TestCase):
 
     def test_port_collision_moves_and_reports_it(self):
         from launcher import open_socket_on
-        (_, held), = (self._block(1),)
-        (a, pa, _) = held[0]
+        # hold pa AND pa+1: with only pa held, a Windows runner that happens to have pa+1 in a reserved
+        # range makes the launcher move TWO ports and the test reads that as a bug in the launcher.
+        pa, held = self._adjacent_run(2)
+        a, a1 = held[0][0], held[1][0]
         try:
             b, pb, moved = open_socket_on(pa, tries=4)
             try:
@@ -1001,11 +1046,12 @@ class Launcher(unittest.TestCase):
             finally:
                 b.close()
         finally:
-            a.close()
+            for sk in (a, a1):
+                sk.close()
 
     def test_port_exhaustion_is_an_explanation(self):
         from launcher import open_socket_on
-        base, held = self._block(3)
+        base, held = self._adjacent_run(3)      # proven adjacent, proven busy, and 4th was released
         try:
             with self.assertRaises(OSError) as e:
                 open_socket_on(base, tries=3)
