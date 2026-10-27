@@ -8,6 +8,13 @@ $ python3 tools/check_docs.py
 $ python3 tests/run_all.py --all
 $ python3 evidence/fuzz_protocol.py --requests 20000 --seed 7
 
+## One command, so the branch rule is enforced by the machine
+
+    sh tools/install_hooks.sh        # sets core.hooksPath -> tools/git-hooks
+
+`tools/git-hooks/pre-commit` refuses any commit made on `main`. It is not part of the gate's `$` lines
+(a gate cannot install itself), but it is the reason the rule below is now mechanical rather than moral.
+
 ## The two git rules this file is run under (F39, learned the expensive way today)
 
 * A commit message with backticks or `$` in it is a **program**: `git commit -m "…"` lets the shell run it
