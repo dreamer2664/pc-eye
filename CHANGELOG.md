@@ -38,6 +38,13 @@ Two of the fixes introduced their own bug and were caught by the same machinery 
 a finiteness guard that called `float()` on a huge int, and a whole-number test that compared a value with
 its own truncation. Suite 67 → 77; the negative control now runs 38 tests against 1.0.2 and 35 go red.
 
+### Housekeeping a merge should not have to mention
+
+`start.sh` had lost its executable bit in a snapshot/restore cycle (it is 100755 upstream, which `git ls-tree`
+confirmed). Restored, plus a `.gitattributes` pinning `*.sh text eol=lf` and `*.bat text eol=crlf`: a shell
+script with CRLF endings fails with `/bin/bash^M: bad interpreter`, and a Windows clone is exactly where that
+would happen.
+
 ### A confident lie became a refusal
 * **F1** `/act` now **stops** when the eyes and the hand are in different coordinate spaces (the prose
   promised this since 1.0.1; the code only bounds-checked). `coord_gate()` is pure → unit-testable.

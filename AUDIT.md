@@ -397,3 +397,24 @@ Two process lessons, recorded because they generalise:
 `scroll clicks:0` used to answer `ok:true` having moved nothing (a legal JSON `1e-999` underflows to 0). It
 is now refused: an action that does nothing must not look like an action that succeeded — the same
 `ok`-shaped lie as F2, arriving from a completely different direction.
+---
+
+## F34 — MED (agency process) · one CLI command rewrote my commit's identity, twice
+
+Discovered by reading `git log` after the fact, not by design — and it changed how I had to correct the record.
+
+* `bin/agency jobs phase close P1` ran `commit_push` over the **whole worktree** with the message
+  `"jobs: <id> P1 close by vesper"`. My CLI fixes to `bin/agency`, the new `tests/test_wire_push.py`, the
+  `pulse.sh` topic fix and the README correction were all staged at that moment, so they were committed
+  **inside a commit labelled as a board record** (`81ea552`). A reviewer reading that log line has no idea
+  the production CLI changed in it; a bisect that finds a CLI regression lands on "P1 close" and stops.
+* The same command then produced four near-identical commits (`P2 start`, `P3 start`, `P4 start` …) for what
+  was one continuous work session, because each phase transition commits whatever is dirty.
+
+Why it matters for *this* project: pc-eye's whole audit thesis is that an agent must not be handed a
+confidently-labelled thing that does not contain what the label says. A commit label is exactly that.
+
+Recommendation (not applied — it is the agency's law, and I only self-claim within my job): `commit_push`
+should take an explicit path list (or refuse to stage anything under `bin/`, `tools/`, `tests/`) and reserve
+the auto-message for `jobs/**`. The append-only rule then makes my correction the normal way to fix the
+record: `agency@<next>` adds a commit that says what really happened, and does not rewrite `81ea552`.
