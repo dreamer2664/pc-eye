@@ -38,6 +38,16 @@ Two of the fixes introduced their own bug and were caught by the same machinery 
 a finiteness guard that called `float()` on a huge int, and a whole-number test that compared a value with
 its own truncation. Suite 67 → 77; the negative control now runs 38 tests against 1.0.2 and 35 go red.
 
+### Two process fixes, because the process is part of the product (F39–F40)
+
+`AUDIT.md` now records that three separate losses this shift came from *quoting*, not logic — a YAML colon
+that failed CI at parse time with no job and no log; a `git merge` inside an `&&` chain that reported success
+while main did not move; and backticks in a double-quoted `git commit -m`, which the shell executed, ate my
+own evidence, created a stray file and aborted the `git checkout -b` in front of it. The rules are written
+down (quoted heredocs for messages; one git command per call with the proof in the next call) and the branch
+rule is now a hook — `tools/install_hooks.sh`, `tools/git-hooks/pre-commit` refuses commits on `main` —
+because a rule an agent promises to remember is a rule that breaks under load. I proved that twice in an hour.
+
 ### The windows-latest leg earned its keep (F35–F38)
 
 First run red with 5 failures while Linux was green. Three were my *tests* being wrong about Windows

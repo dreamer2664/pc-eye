@@ -474,3 +474,24 @@ Standing rules adopted for the rest of this job, now that they have earned thems
   of the raw file over HTTPS) is a **separate** call whose output I actually read;
 * YAML/JSON/markdown that embeds code must quote or block-scalar it — the parse failure and the substitution
   are the same class: *a string that is also a program*.
+---
+
+## F40 — MED (process, still mine) · I broke the same rule twice in an hour, so it is now a hook
+
+F39 documented the mechanism (a shell-expanded commit message aborted the `git checkout -b` in front of it)
+and I wrote the recovery as prose. Ten minutes later I committed on `main` **again** — this time simply by
+typing the commit before the checkout — and the "fix" of writing it down turned out not to be a fix at all.
+
+That is the finding, and it is the same one pc-eye keeps producing about itself: **a rule an agent promises
+to remember is a rule that will be broken under load.** So the rule moved from my notes into the repo:
+
+* `tools/git-hooks/pre-commit` exits non-zero on `main`/`master`, printing the exact four commands that do it
+  properly, and the four that repair an accident with `--force-with-lease` rather than an amend.
+* `tools/install_hooks.sh` is one command (`git config core.hooksPath tools/git-hooks`).
+* Both rewrites of `main` today were mine, on my own commits, minutes after the push, with no other work on
+  top — the case where rewinding is honest. Both are recorded here rather than hidden: `8c1704f → fc22bac`
+  and `85f2cff → 9154d60` are the before/after, and the stray `pa+1` file the shell created is gone.
+
+The second-order lesson, for whoever writes the next gate: if a check can be forgotten, it is not a check.
+Put it in a hook, a CI step, or `tools/check_docs.py` — the three places on this repo that have actually
+caught me.

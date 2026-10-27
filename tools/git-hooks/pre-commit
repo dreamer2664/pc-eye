@@ -1,0 +1,29 @@
+#!/bin/sh
+# pre-commit — the rule "never commit on main" is not a memory exercise.
+#
+# Why this file exists: today I committed straight onto main TWICE. The first time, backticks inside a
+# double-quoted `git commit -m` were command-substituted by the shell, which aborted the `git checkout -b`
+# that was chained in front of it (AUDIT.md F39); the second time I typed the commit first and the checkout
+# afterwards. Both produced a main that no one else could review as a change, and both needed a
+# force-with-lease rewind to fix. A hook is the only version of this rule that survives a tired agent.
+#
+# Escape hatch (for the human, deliberately awkward): git commit --no-verify
+branch=$(git symbolic-ref --short -q HEAD || echo "(detached)")
+if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+  cat >&2 <<EOF
+BLOCKED: you are on $branch.
+
+  Agents do not commit on $branch. Do this instead:
+      git branch agent/<name>/<id> && git checkout agent/<name>/<id>
+      # commit, then bring it back the reviewable way:
+      git checkout $branch && git merge --no-ff agent/<name>/<id>
+
+  Already committed here by accident? Move it rather than amending $branch:
+      git branch agent/<name>/<id>            # capture the commit
+      git reset --hard HEAD~1                 # $branch back to the merge it belongs under
+      git push --force-with-lease origin $branch
+      git merge --no-ff agent/<name>/<id>     # re-land it as a merge, and say so in the log
+EOF
+  exit 1
+fi
+exit 0
