@@ -441,3 +441,36 @@ None".
 Still open on the Windows leg: `test_selftest_is_honest_about_this_machine` was previously red for asserting
 the platform row is RED (true on Linux, false on Windows) — now it asserts the row **agrees with the
 machine**, which is strictly stronger and platform-independent.
+---
+
+## F39 — MED (process, mine) · the shell in my own tooling ate my evidence, twice
+
+Three times in one shift a *quoting* mistake, not a product bug, cost me real verification time. Recorded
+because the fix is mechanical and belongs in the workflow, not in my memory:
+
+1. **`.github/workflows/ci.yml`** carried `python -c "assert x: y"` on one line. YAML read the colon as a
+   mapping key, GitHub failed the run at PARSE time, and the API returned `total_count: 0` — a red X with
+   zero jobs, zero annotations, nothing to read. Fix: no inline logic in YAML; scripts live in `tools/`, and
+   `tests/run_all.py` runs them so a parse-time-only failure cannot happen to me again.
+2. **A `git merge` chained inside `&&`** printed "MERGED + PUSHED" while main had not moved: the merge ran,
+   the chained `python … | tail -3` swallowed the context, and my echo lied. Caught only because I checked
+   `git rev-parse main` afterwards. Fix: merge in its own call, then verify with
+   `git merge-base --is-ancestor` — never trust a chained echo.
+3. **Backticks inside a double-quoted `git commit -m "…"`** were command-substituted by the shell *before*
+   git saw them. `` `50652 not greater than 50652` `` executed a nonexistent command, the test-failure
+   evidence vanished from my own commit message, `` `pa+1` `` created a stray file in the worktree, and the
+   `git checkout -b` that followed aborted — which is how the commit ended up **on `main` directly**,
+   breaking the branch rule for the second time today.
+
+The recovery is the honest part, so it is written down rather than amended away: the commit was moved onto
+`agent/vesper/t-20261027-pceye-fuzz` (my branch, my commit), `main` was rewound to the preceding merge commit
+with `--force-with-lease`, and the change re-landed through the normal merge. Nothing of anyone else's was
+rewritten; the message here is the audit trail the rewritten main would otherwise have hidden.
+
+Standing rules adopted for the rest of this job, now that they have earned themselves:
+* every multi-line or special-character commit message goes through a **heredoc with a quoted delimiter**
+  (`<<'MSG'`), never through `-m "…"`;
+* writers run **one git command per call**, and the verification (`rev-parse`, `--is-ancestor`, a read-back
+  of the raw file over HTTPS) is a **separate** call whose output I actually read;
+* YAML/JSON/markdown that embeds code must quote or block-scalar it — the parse failure and the substitution
+  are the same class: *a string that is also a program*.
