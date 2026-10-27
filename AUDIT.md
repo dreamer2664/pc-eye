@@ -613,3 +613,37 @@ classes can pick the same port — a TOCTOU race that the ~1,900 TIME-WAIT socke
 have made likelier, and which is a candidate for the next unexplained red here. Closing it means `build()`
 accepting a bound socket instead of a port number, i.e. an API change to the thing under audit, in a turn that
 had other work to do. Recorded in `PC-EYE.md`/here so the next person does not re-derive it.
+
+### F44 · MED · `Protocol` asserted a screen size it never asked for, and was green on Windows only by inheriting another class's stub
+
+*Found:* 2026-10-27 14:58Z (vesper), as the second half of F43 — it is what the leak had been covering for.
+*Status:* fixed, `tests/test_pc_eye.py` (`Protocol` pins `display_rect`) + `tests/run_ordered.py --isolated`.
+
+`/state` prefers the OS over the injected fake: `rect = self.display_rect()`, and `sz = (…) if rect else
+self.screen.size()`. `Protocol` installs `FakeScreen` (1920×1080) and asserts `body["screen"] == [1920, 1080]`
+— but on a machine with a real display, `display_rect()` answers and the fake is never consulted. Headless Linux
+returns nothing, so the fallback fires and the assertion is true; `windows-latest` has a desktop at 1024×768 and
+the assertion is false. It had been passing on the Windows leg for exactly one reason: `FuzzFindings` left a
+1920×1080 `display_rect` stub welded onto the shared `Handler`, and under `unittest discover`'s alphabetical
+order the fuzzer ran *before* `Protocol`. Fixing F43 removed the crutch and the test went red on Windows in the
+same push — which is the correct outcome and the real finding: **the suite was not testing the same thing on
+both platforms, and the bug report that revealed it came from the leak fix, not from a Windows user.**
+
+Fixed by making `Protocol` install the geometry it asserts about (save/restore via `save_seams`), so the
+assertion means the same thing everywhere. Verified by A/B rather than by reading: a `display_rect` that answers
+like a desktop, with and without the pin — without it `Protocol` fails, with it `Protocol` passes. (Two other
+tests failed under that same simulation; both were the simulation's fault, not the product's — they patch
+`pceye.display_rect` at module level and call it directly, and my override bypassed the cache they assert on.
+The real Windows legs in CI are the arbiter for those, and they are the reason the legs exist.)
+
+Two general rules come out of this, both now enforced rather than advised:
+
+1. **A test that asserts a fake must install the fake.** An assertion about geometry, a clock, or a screen size
+   that relies on "nobody else in this process touched it" is a cross-platform lie waiting for a runner that
+   changes the order. `--isolated` runs every class alone in its own process and fails anything that cannot stand
+   by itself: the green that needs company is the interesting one.
+2. **Module-level patches do not reach the handler.** `Handler.display_rect = staticmethod(display_rect)` binds
+   the *function object* at import; rebinding `pceye.display_rect` afterwards changes the module's name, not the
+   class's attribute. Every test that wants to steer handler behaviour must patch the class (which is why these
+   sites all go through `save_seams`/`restore_seams` now) — and this is the trap the F41 `Launcher` test nearly
+   fell into too, from the other side.

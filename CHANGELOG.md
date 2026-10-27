@@ -162,3 +162,15 @@ First live run on CarloPC. Found and fixed the DPI coordinate split (capture 192
 - **Docs**: README's test count regenerated (79 → 82) by `tools/check_docs.py`, which is the check that flagged
   it; SHIP_GATE now says to run both orders.
 - Not fixed, logged: `free_port()`'s bind-then-close TOCTOU (two classes can pick the same port).
+
+## Unreleased — 2026-10-27 (vesper): a test that was green because of the leak (F44)
+
+- `Protocol` asserted `/state`'s `screen` was 1920×1080 while only faking the *screen*, not the *geometry* the
+  handler prefers. True headless, false on a real desktop; on `windows-latest` it had been passing solely
+  because `FuzzFindings` leaked a `display_rect` stub that ran first in alphabetical order. Now the class pins
+  `display_rect` (and restores it), so the assertion is platform-independent.
+- `tests/run_ordered.py --isolated`: each class alone in its own process, added to `tests/run_all.py`. It fails a
+  test that is green only in company, and it prints the import error instead of eight fake reds when the module
+  cannot load (verified both ways, including a deliberately broken import).
+- Gate: `python3 tests/run_all.py` is 4 steps — `unittest discover` (alphabetical, as CI), source order, each
+  class alone, docs check.
