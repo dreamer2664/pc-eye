@@ -8,6 +8,13 @@ $ python3 tools/check_docs.py
 $ python3 tests/run_all.py --all
 $ python3 evidence/fuzz_protocol.py --requests 20000 --seed 7
 
+## The two git rules this file is run under (F39, learned the expensive way today)
+
+* A commit message with backticks or `$` in it is a **program**: `git commit -m "…"` lets the shell run it
+  before git sees it. Every message here goes through `git commit -F - <<'MSG'` with a quoted delimiter.
+* A `git merge` inside an `&&` chain can print success and change nothing. Merge in its own call, then prove
+  it: `git rev-parse --short main` and `git merge-base --is-ancestor <branch> main`. Never trust an echo.
+
 ## What a green gate does NOT prove — say this out loud, do not paper over it
 
 * it does **not** prove a click lands on the right pixel. Only `/selftest`, `coord_space.consistent` and
