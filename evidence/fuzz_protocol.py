@@ -219,8 +219,12 @@ def main():
     pceye.Handler._close_log()
     print(f"fuzz {a.requests} requests in {dt:.1f}s (seed {a.seed}) · server alive after: {alive}")
     print("status codes:", dict(sorted(codes.items())))
+    # ^[A-Za-z_.]*(Error|Exception) misses TypeError/ValueError (they have no "Error" suffix pattern of
+    # their own) if the leading module prefix is absent — so enumerate the known exception names too. A
+    # fuzzer that cannot see a TypeError is how 33 of them walked past me on the Windows leg.
+    EXCS = ("Error", "Exception", "Interrupt", "Exit", "Warning", "Failure")
     trace = [l.strip() for l in captured.getvalue().splitlines()
-             if re.match(r"^[A-Za-z_.]*(Error|Exception|Interrupt):", l.strip())
+             if re.match(r"^[A-Za-z_.]*(" + "|".join(EXCS) + r"):", l.strip())
              and "peer vanished" not in l]
     if trace:
         for line in sorted(set(trace)):

@@ -875,6 +875,51 @@ class FuzzFindings(unittest.TestCase):
             self.assertEqual(code, 409, bad)
             self.assertIn("error", body)
 
+    def test_the_HEADER_flush_is_peer_gone_safe_too(self):
+        """F41, and the reason the guard is a funnel rather than a `try` around the body write.
+
+        On Linux a vanished peer surfaces as BrokenPipeError at the first real write; on Windows it surfaces
+        as ConnectionAbortedError (WSAECONNABORTED) from the flush inside end_headers() — and 10053 is NOT a
+        subclass of ConnectionResetError there. Guarding `wfile.write(body)` alone (which is what I did, and
+        which passed on Linux) left 33 tracebacks on the windows-latest leg, all of them on the cross-origin
+        refusal where there is no body at all.
+
+        So: abort the socket after the request line is read, with no body, and demand silence.
+        """
+        import http.client
+        import socket as S
+        for path in ("/act", "/shot", "/state"):
+            c = S.socket(S.AF_INET, S.SOCK_STREAM)
+            c.connect(("127.0.0.1", self.port))
+            c.sendall((f"POST {path}?t={self.token} HTTP/1.0\r\n"
+                       f"Content-Type: application/json\r\nOrigin: https://evil.example\r\n"
+                       f"Content-Length: 40\r\n\r\n").encode())   # headers only; body never arrives
+            c.shutdown(S.SHUT_WR)
+            c.setsockopt(S.SOL_SOCKET, S.SO_LINGER, __import__("struct").pack("ii", 1, 0))  # hard RST
+            c.close()
+        time.sleep(0.35)
+        # The server must be healthy AND have printed nothing: a traceback is the finding here, not a status.
+        code, body = self.raw(b'{"action":"click","x":10,"y":10}')
+        self.assertEqual(code, 200, f"server must survive an aborted write: {body}")
+
+    def test_a_peer_abort_is_not_reported_as_a_real_error(self):
+        """The list is deliberate, and so is what is NOT in it: a disk-full write must stay loud.
+
+        `_peer_vanished` may not degrade into `except OSError: pass` — that would also swallow a broken log
+        handle, a full disk, or a bug in a custom stream, which are precisely the things an operator needs.
+        """
+        h = pceye.Handler
+        self.assertTrue(h._peer_vanished(BrokenPipeError(32, "broken pipe")))
+        self.assertTrue(h._peer_vanished(ConnectionAbortedError(10053, "aborted")))   # the Windows code
+        self.assertTrue(h._peer_vanished(OSError(32, "broken pipe")))                  # errno, not class
+        self.assertFalse(h._peer_vanished(OSError(28, "no space left on device")),
+                         "ENOSPC is not 'the peer went away'; swallowing it hides an outage from the human")
+        self.assertFalse(h._peer_vanished(OSError(9, "bad file descriptor")))
+        self.assertFalse(h._peer_vanished(ValueError("i/o on closed file")))
+        self.assertIn(10053, h.PEER_ERRNOS, "the Windows abort code must be in the product's list, not "
+                                           "inferred from the exception class")
+        self.assertIn(10054, h.PEER_ERRNOS)
+
     def test_a_client_that_hangs_up_does_not_write_a_traceback(self):
         """A phone pulling to refresh closes the socket mid-write; BaseHTTPRequestHandler let the
         BrokenPipeError escape, so the human's console fills with tracebacks for a non-event."""
