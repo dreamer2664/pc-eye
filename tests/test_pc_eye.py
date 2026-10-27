@@ -68,6 +68,32 @@ def free_port():
         return s.getsockname()[1]
 
 
+_MISSING = object()
+
+
+def save_seams(cls, *names):
+    """Capture class attributes as DESCRIPTORS, which is not the same thing as reading them.
+
+    `cls.input_space` on a `@staticmethod` hands back the bare function. Assign that value with
+    `cls.input_space = saved` and you have installed an *instance method*: every later `self.input_space()`
+    passes the instance to a zero-argument function and dies with `TypeError: input_space() takes 0
+    positional arguments but 1 was given`. `cls.__dict__[name]` is the staticmethod object itself, and that
+    is what restores correctly. AUDIT.md F43: this exact line was in this file for a full day, red for
+    anyone running pytest and green for CI, because the two runners put the classes in different orders.
+    """
+    return {n: (cls.__dict__[n] if n in cls.__dict__ else _MISSING) for n in names}
+
+
+def restore_seams(cls, saved):
+    """Put back exactly what save_seams took, including 'nothing was there'."""
+    for name, val in saved.items():
+        if val is _MISSING:
+            if name in cls.__dict__:
+                delattr(cls, name)
+        else:
+            setattr(cls, name, val)
+
+
 class Client:
     def __init__(self, base, token):
         self.base, self.token = base, token
@@ -286,7 +312,7 @@ class WindowsBehaviour(unittest.TestCase):
         self._rect = pceye.display_rect
         pceye._display_cache.update(rect=None, at=0.0)        # no stale geometry between tests
         cls = pceye.Handler
-        self._cls_seams = (cls.input_space, cls.display_rect)
+        self._cls_seams = save_seams(cls, "input_space", "display_rect")
         cls.input_space = staticmethod(lambda: pceye.input_space())
         cls.display_rect = staticmethod(lambda force=False: pceye.display_rect(force))
         self.tmp = tempfile.TemporaryDirectory(prefix="pceye-w-")
@@ -302,7 +328,7 @@ class WindowsBehaviour(unittest.TestCase):
     def tearDown(self):
         self.srv.shutdown(); self.srv.server_close()
         getattr(pceye.Handler, '_close_log', lambda: None)()
-        pceye.Handler.input_space, pceye.Handler.display_rect = self._cls_seams
+        restore_seams(pceye.Handler, self._cls_seams)
         self.tmp.cleanup()
         pceye.input_space, pceye.cursor_pos = self._space, self._cursor
         pceye.display_rect = self._rect
@@ -721,16 +747,17 @@ class RegressionV103(unittest.TestCase):
             seen.append(1)
             return real(self, *a, **k)
 
-        orig_screen, pceye.Screen.grab = pceye.Handler.screen, spy
+        _seams = save_seams(pceye.Handler, "screen", "display_rect")
+        pceye.Screen.grab = spy
         pceye.Handler.screen = pceye.Screen(1440)
-        orig_rect, pceye.Handler.display_rect = pceye.Handler.display_rect, staticmethod(lambda force=False: [0, 0, 1920, 1080])
+        pceye.Handler.display_rect = staticmethod(lambda force=False: [0, 0, 1920, 1080])
         try:
             code, body, _ = self.c.get("/state")
             self.assertEqual(code, 200)
             self.assertEqual(body["screen"], [1920, 1080])
             self.assertEqual(len(seen), 0, f"/state performed {len(seen)} screen capture(s)")
         finally:
-            pceye.Handler.screen, pceye.Handler.display_rect = orig_screen, orig_rect
+            restore_seams(pceye.Handler, _seams)
             pceye.Screen.grab = real
 
     def test_display_rect_is_cached_and_expires(self):
@@ -800,6 +827,7 @@ class FuzzFindings(unittest.TestCase):
                               os.path.join(cls.tmp.name, "f.log"), dry_run=True)
         cls.srv.RequestHandlerClass.screen = FakeScreen()
         pceye.Handler.limits = None
+        cls._handler_seams = save_seams(pceye.Handler, "input_space", "display_rect", "limits", "screen")
         pceye.Handler.input_space = staticmethod(lambda: [1920, 1080])
         pceye.Handler.display_rect = staticmethod(lambda force=False: [0, 0, 1920, 1080])
         cls._cur = pceye.cursor_pos
@@ -812,7 +840,11 @@ class FuzzFindings(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown(); cls.srv.server_close()
         getattr(pceye.Handler, "_close_log", lambda: None)()
-        pceye.Handler.limits = None
+        # It used to put `limits` back and leave the two geometry stubs welded onto the production handler.
+        # That is worse than the crash above: every class that ran after the fuzzer in the same process
+        # silently tested against a fixed 1920x1080 input space and passed assertions about scaling it had
+        # not earned. A leak that crashes is a gift; a leak that lies is a debt.
+        restore_seams(pceye.Handler, cls._handler_seams)
         pceye.cursor_pos = cls._cur
         cls.tmp.cleanup()
 
@@ -1013,6 +1045,64 @@ class FuzzFindings(unittest.TestCase):
         self.assertIn("hard failures: 0", r.stdout)
         self.assertNotIn(" 500:", r.stdout, "a 500 means an exception escaped the route")
         self.assertIn("server alive after: True", r.stdout)
+
+
+
+class ZSeamIntegrity(unittest.TestCase):
+    """Last in the file, and named so that it is also last under unittest's alphabetical loader.
+
+    Both orders are deliberate: pytest runs classes in source order, `unittest discover` (which is what CI
+    invokes) runs them A to Z. That disagreement is how AUDIT.md F43 survived a day of green CI — the test
+    that poisoned a shared class seam happened to run *after* the tests it broke. This class is the
+    assertion the leak cannot satisfy in either order.
+    """
+
+    def test_handler_geometry_seams_are_still_the_real_staticmethods(self):
+        for name in ("input_space", "display_rect"):
+            got = pceye.Handler.__dict__.get(name)
+            self.assertIsInstance(
+                got, staticmethod,
+                f"Handler.{name} is a {type(got).__name__} after the suite ran. A bare function there turns "
+                f"self.{name}() into a 1-argument call on a 0-argument function and breaks every test that "
+                f"runs afterwards in the same process — which is an order-dependent failure, i.e. the kind "
+                f"that passes CI and fails the laptop")
+            self.assertIs(
+                got.__func__, getattr(pceye, name),
+                f"Handler.{name} still points at a stub left behind by another test class; the geometry that "
+                f"follows it is invented, and assertions about scaling would be vacuous")
+
+    def test_save_seams_round_trips_a_descriptor(self):
+        class C:
+            @staticmethod
+            def f():
+                return 42
+
+        saved = save_seams(C, "f", "absent")
+        C.f = lambda: 7                       # patched the wrong way on purpose
+        restore_seams(C, saved)
+        self.assertIsInstance(C.__dict__["f"], staticmethod, "save/restore must preserve the descriptor")
+        self.assertEqual(C.f(), 42)
+        self.assertNotIn("absent", C.__dict__, "a name that was not there must not be created by restoring")
+
+    def test_the_two_runners_agree_about_class_order(self):
+        """The finding, pinned: an order-dependent bug needs a runner that can be bitten by it.
+
+        `run_ordered.py` exists so the gate contains at least one pass in source order. If somebody later
+        "simplifies" the gate back to a single `unittest discover`, this test says out loud what was lost.
+        """
+        import subprocess
+        import sys
+        if os.environ.get("PCEYE_ORDERED"):
+            # run_ordered.py sets this for its own process; without the guard, each runner would spawn the
+            # other and the suite would recurse until the box ran out of processes
+            self.skipTest("already inside the ordered pass — the recursion guard")
+        root = pathlib.Path(__file__).resolve().parent.parent
+        r = subprocess.run([sys.executable, str(root / "tests" / "run_ordered.py")],
+                           capture_output=True, text=True, cwd=str(root), timeout=600,
+                           env={**os.environ, "PCEYE_ORDERED": "1"})
+        self.assertEqual(r.returncode, 0, f"source-order pass is red:\n{(r.stdout or '')[-1500:]}")
+        self.assertIn("green", r.stdout, r.stdout[-400:])
+
 
 
 if __name__ == "__main__":

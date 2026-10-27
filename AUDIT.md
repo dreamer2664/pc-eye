@@ -573,3 +573,43 @@ Two lessons from building the gate, both about my own tooling rather than the pr
 
 Cross-platform rule, written down because the repo keeps relearning it: on this project, `open()`/`read_text`
 without `encoding=` is a bug even when the code is Linux-only, because the CI leg is not.
+
+### F43 · MED · the test suite poisoned a shared class seam, and CI's runner order hid it for a full day
+
+*Found:* 2026-10-27 14:50Z (vesper), by running `python3 -m pytest tests/ -q` after the soak, on a tree CI had
+declared green. *Status:* fixed, `tests/test_pc_eye.py` + `tests/run_ordered.py`.
+
+`WindowsBehaviour.tearDown` restored the two handler seams it had patched with
+`pceye.Handler.input_space, pceye.Handler.display_rect = self._cls_seams`, where the save side had read
+`cls.input_space` **off the class**. Reading a `staticmethod` off a class hands you the bare function; writing
+that back installs an *instance method*. So from that moment in a process, every `self.input_space()` in
+`server.py` raised `TypeError: input_space() takes 0 positional arguments but 1 was given` — 8 red tests in
+`RegressionV103`, the class that happens to sit after it in the file.
+
+Two things make it worth a number rather than a quiet fix:
+
+1. **CI could not have seen it.** `tools/ship.sh`/CI run `python tests/run_all.py --all`, whose suite step is
+   `unittest discover` — which loads classes **alphabetically**: `RegressionV103` before `WindowsBehaviour`, so
+   the victim ran before the poison and everything passed. The same code, run in pytest's **source order**, is
+   red. Both runners were honest; the gate sampled one of the two orders. Any shared-mutable-state defect is
+   only as visible as the order you happen to run in — so the gate now runs *both* (`tests/run_ordered.py`,
+   classes in source order taken from the AST, because pytest is not a dependency and is absent from the Windows
+   images CI uses), and `ZSeamIntegrity` asserts in either order that the seams are back to being `staticmethod`
+   objects whose `__func__` is the module function.
+2. **My own hardening made it fatal and I shipped it anyway.** The `self.input_space()` call that crashes is
+   inside the /act bounds gate I added in `76bf8d4`, the first commit of this audit; the leak predates it. At
+   `76bf8d4` the same command was `10 failed, 57 passed` and I ran per-class commands that were green, so I
+   recorded "tests pass" without ever running the file in one process. *Every* "N passed" I have quoted today is
+   suspect for the same reason, which is why the fix is in the gate and not in my notes.
+
+Also found in the pass and fixed: the fuzz class patched `Handler.input_space`/`display_rect` to a fixed
+1920x1080 and **never restored them** — a leak that does not crash, so every class after it silently tested
+against invented geometry and could pass scaling assertions it had not earned. The `ZSeamIntegrity` identity
+check (`__func__ is pceye.input_space`) is what catches that shape, and it is the more dangerous of the two: a
+leak that crashes is a gift, a leak that lies is a debt.
+
+Observed and *not* fixed, deliberately: `free_port()` binds port 0, closes it and returns the number, so two
+classes can pick the same port — a TOCTOU race that the ~1,900 TIME-WAIT sockets from my 200k-request soak would
+have made likelier, and which is a candidate for the next unexplained red here. Closing it means `build()`
+accepting a bound socket instead of a port number, i.e. an API change to the thing under audit, in a turn that
+had other work to do. Recorded in `PC-EYE.md`/here so the next person does not re-derive it.
