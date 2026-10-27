@@ -9,6 +9,7 @@ told to trust got a table that did not answer its error code. A doc an agent tru
 Usage: python3 tools/check_docs.py
 """
 import os
+import ast
 import re
 import sys
 
@@ -87,6 +88,46 @@ def check_encodings(root):
     return bad
 
 
+def suite_count():
+    """How many tests the runner will actually run.
+
+    It used to be `len(re.findall("def test_", suite_source))`, and that number was wrong in the same hour I
+    wrote "a check may not pass by finding nothing": a fixture string inside a test contained the text
+    `def test_a()`, the grep counted it, and README was failed for 86 against the 85 the runner collects.
+    A count taken from a text pattern is a count of the pattern, not of the thing.
+
+    So ask unittest. If the module cannot be imported (an optional dependency, an import-time platform guard),
+    fall back to counting `test_*` methods inside TestCase classes from the AST — a structural count, not a
+    substring search — and print which method produced the number so it is never unexplained.
+    """
+    import io
+    import contextlib
+
+    path = os.path.join(ROOT, "tests", "test_pc_eye.py")
+    try:
+        import importlib.util
+        import sys
+        import unittest
+
+        sys.path.insert(0, os.path.join(ROOT, "tests"))
+        spec = importlib.util.spec_from_file_location("pceye_suite", path)
+        mod = importlib.util.module_from_spec(spec)
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            spec.loader.exec_module(mod)
+        n = unittest.TestLoader().loadTestsFromModule(mod).countTestCases()
+        if n:
+            return n
+    except Exception:
+        pass                                        # fall through to the structural count
+    tree = ast.parse(read("tests/test_pc_eye.py"), filename=path)
+    total = 0
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and any("TestCase" in ast.unparse(b) for b in node.bases):
+            total += sum(1 for f in node.body
+                         if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("test"))
+    return total
+
+
 def main() -> int:
     src = read("server.py")
     m = re.search(r'^VERSION = "([0-9.]+)"', src, re.M)
@@ -101,10 +142,20 @@ def main() -> int:
             fails.append(f"{doc} does not mention version {ver}")
 
     readme = read("README.md")
-    tests = len(re.findall(r"def test_", read("tests/test_pc_eye.py")))
-    declared = re.findall(r"(\d+) tests, headless-safe", readme)
-    if declared and int(declared[0]) != tests:
-        fails.append(f"README advertises {declared[0]} tests; the suite defines {tests}")
+    tests = suite_count()
+    # F55: this used to look for one magic phrase — `(\d+) tests, headless-safe` — and to check nothing at all
+    # when it found none. Reword the sentence and the doc check goes green while the number rots: a check that
+    # is conditional on prose is a check that prose can switch off, and mine was switched off by my own docs
+    # edit an hour after I wrote it. So: every count README states about the suite must match, however it is
+    # phrased. Silence is still allowed (a README may talk about tests without promising a number); a WRONG
+    # number is not, and neither is a number that used to be checkable and now is not.
+    declared = re.findall(r"(?<![A-Za-z0-9])(\d+)(?:\s*\+)?\s+tests\b(?![/.\_])", readme)
+    wrong = sorted({d for d in declared if int(d) != tests})
+    if wrong:
+        fails.append(f"README advertises {', '.join(wrong)} tests; the suite defines {tests} "
+                     f"(every count README states must match — the check no longer depends on a "
+                     f"phrase, and `python3 tests/run_all.py` is not a count: the lookbehind and the path "
+                     f"guard are what keep filenames out of the arithmetic)")
 
     for doc in ("README.md", "PC-EYE.md"):
         for route in sorted(set(re.findall(r"(?:GET|POST) (/[a-z_]+)", read(doc)))):

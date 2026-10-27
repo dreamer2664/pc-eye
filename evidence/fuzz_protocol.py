@@ -123,6 +123,23 @@ def gen_query(rnd):
         parts.append("&".join(rnd.choice(["a=1", "region", "max=", "=%20", "t="]) for _ in range(2)))
     return "&".join(parts)
 
+REQ_TIMEOUT = 20        # seconds: a watchdog on a loaded runner, not a latency
+                # budget — evidence/BENCH_*.json measures latency, this file measures honesty
+
+
+def transport(e):
+    """Is this exception about the socket, or about the response? Only the second is a protocol finding.
+
+    The distinction the harness rests on (F36): a closed or slow connection looks exactly like a dead PC to a
+    client, so it has to be checked against the control question instead of counted as a crash.
+    """
+    if isinstance(e, (TimeoutError, ConnectionResetError, BrokenPipeError, RemoteDisconnected,
+                      http.client.BadStatusLine)):
+        return True
+    if isinstance(e, urllib.error.URLError):
+        return isinstance(e.reason, OSError)
+    return False
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -150,13 +167,21 @@ def main():
     codes, hard, soft = {}, [], 0
 
     def still_alive():
-        """The control question. Every 'the connection died' is only a finding if the server is also gone."""
-        try:
-            with urllib.request.urlopen(base + f"/state?t={tok}", timeout=4) as r:
-                r.read()
-                return r.status == 200
-        except Exception:
-            return False
+        """The control question. Every 'the connection died' is only a finding if the server is also gone.
+
+        F54: it used to ask once, with `timeout=4`. Under CI load — three suite passes in one job since F52 — a
+        four-second probe times out on a server that is entirely alive, and a false "dead" turns a slow runner
+        into a reported crash. Ask patiently, twice: this answer decides whether someone is told their PC died.
+        """
+        for wait in (15, 30):
+            try:
+                with urllib.request.urlopen(base + f"/state?t={tok}", timeout=wait) as r:
+                    r.read()
+                    if r.status == 200:
+                        return True
+            except Exception:
+                time.sleep(1)
+        return False
 
     # The handler prints tracebacks to stderr; that is the ground truth of a crash, so capture it whole.
     real_err, sys.stderr = sys.stderr, io.StringIO()
@@ -167,7 +192,7 @@ def main():
                 q = gen_query(rnd)
                 url = base + "/shot?" + (q + ("&" if q else "") + "t=" + tok)
                 try:
-                    with urllib.request.urlopen(url, timeout=8) as r:
+                    with urllib.request.urlopen(url, timeout=REQ_TIMEOUT) as r:
                         codes[r.status] = codes.get(r.status, 0) + 1
                         r.read()
                 except urllib.error.HTTPError as e:
@@ -184,7 +209,7 @@ def main():
                 req = urllib.request.Request(base + "/act" + q, data=gen_body(rnd), method="POST",
                                              headers=hdrs)
                 try:
-                    with urllib.request.urlopen(req, timeout=8) as r:
+                    with urllib.request.urlopen(req, timeout=REQ_TIMEOUT) as r:
                         codes[r.status] = codes.get(r.status, 0) + 1
                         body = r.read()
                         if r.status != 204 and body and r.headers.get("Content-Type", "").startswith(
@@ -197,22 +222,25 @@ def main():
                         json.loads(body)
                     except Exception:
                         hard.append(f"HTTP {e.code} with a non-JSON body: {body[:120]!r}")
-        except (RemoteDisconnected, ConnectionResetError, http.client.BadStatusLine) as e:
-            # A closed socket LOOKS like a dead PC to an agent, which is exactly the bug class we hunt. But
-            # it is also what a keep-alive race looks like to a test client. Tell them apart the only honest
-            # way: ask the server, right now, whether it is still answering.
-            if still_alive():
-                soft += 1
-            else:
-                hard.append(f"request {i}: {type(e).__name__} AND the server stopped answering — crash, "
-                            f"not a refusal")
         except Exception as e:
-            hard.append(f"request {i}: client-side {type(e).__name__}: {e}")
+            # The two handlers used to be split by exception *type*, and the split was wrong: a timeout fell
+            # into the catch-all and was counted as a crash without the control question ever being asked —
+            # which is how a docs-only commit went red on windows-latest,3.13 (F54). Classify by what the
+            # exception is ABOUT, then ask the question. A non-JSON body or a 500 is not "about the socket"
+            # and stays hard, so nothing real is being excused.
+            if transport(e):
+                if still_alive():
+                    soft += 1
+                else:
+                    hard.append(f"request {i}: {type(e).__name__} AND the server stopped answering — crash, "
+                                f"not a refusal")
+            else:
+                hard.append(f"request {i}: client-side {type(e).__name__}: {e}")
     dt = time.time() - t0
     captured, sys.stderr = sys.stderr, real_err
     alive = True
     try:
-        urllib.request.urlopen(base + f"/state?t={tok}", timeout=8).read()
+        urllib.request.urlopen(base + f"/state?t={tok}", timeout=REQ_TIMEOUT).read()
     except Exception:
         alive = False
     srv.shutdown(); srv.server_close()

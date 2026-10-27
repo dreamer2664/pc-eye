@@ -1086,6 +1086,111 @@ class ZSeamIntegrity(unittest.TestCase):
                 f"Handler.{name} still points at a stub left behind by another test class; the geometry that "
                 f"follows it is invented, and assertions about scaling would be vacuous")
 
+    def test_the_count_is_the_collected_suite_not_a_grep(self):
+        """F55's own follow-up, caught by this very file: a fixture string containing `def test_a()` made the
+        grep count 86 while the runner collects 85. Pin the rule that the number comes from the suite."""
+        import importlib.machinery
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("cd_count", HERE / "tools" / "check_docs.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.ROOT = HERE
+        n = mod.suite_count()
+        collected = unittest.TestLoader().loadTestsFromModule(
+            __import__("test_pc_eye")).countTestCases()
+        self.assertEqual(n, collected, "the doc count must be what the runner runs, not a substring count")
+        self.assertGreater(n, 60, "a count of ~0 means the fallback found nothing, which is F55 again")
+        grep = len(re.findall(r"def test_", (HERE / "tests" / "test_pc_eye.py").read_text(encoding="utf-8")))
+        self.assertLessEqual(n, grep, "the file text can only over-count, never under-count")
+
+    def test_the_docs_count_check_cannot_be_reworded_away(self):
+        """F55: the count check used to grep for one magic phrase, so rewording a sentence disabled it silently.
+
+        Run against a scratch tree rather than the repo: a test that edits the real README to prove a point is a
+        test that can only pass by breaking the thing it checks.
+        """
+        import contextlib
+        import importlib.machinery
+        import importlib.util
+        import io
+        import shutil
+        import tempfile
+
+        def verdict(readme_text, suite_defs):
+            with tempfile.TemporaryDirectory(prefix="pceye-docs-") as tmp:
+                root = pathlib.Path(tmp)
+                (root / "tests").mkdir()
+                shutil.copy(HERE / "tools" / "check_docs.py", root / "check_docs.py")
+                shutil.copy(HERE / "server.py", root / "server.py")
+                (root / "tests" / "test_pc_eye.py").write_text(
+                    "".join(f"def test_{w}():\n    pass\n" for w in "abc"[:suite_defs]), encoding="utf-8")
+                (root / "README.md").write_text(readme_text, encoding="utf-8")
+                ld = importlib.machinery.SourceFileLoader("cd_probe", str(root / "check_docs.py"))
+                spec = importlib.util.spec_from_loader("cd_probe", ld)
+                mod = importlib.util.module_from_spec(spec)
+                saved = os.getcwd()
+                os.chdir(root)
+                buf = io.StringIO()
+                try:
+                    ld.exec_module(mod)
+                    mod.ROOT = root
+                    mod.read = lambda name: (root / name).read_text(encoding="utf-8") if (root / name).exists() else ""
+                    with contextlib.redirect_stdout(buf):
+                        rc = mod.main()
+                finally:
+                    os.chdir(saved)
+                return rc, buf.getvalue()
+
+        # The scratch tree has no refusal table, so `main()`'s exit code is not the signal here — the count line
+        # is. Asserting on the code instead would make this test fail for reasons it is not about, which is how
+        # a check gets ignored rather than read.
+        def count_line(out):
+            return [l for l in out.splitlines() if "the suite defines" in l]
+
+        rc, out = verdict("# pc-eye\n\nVERSION 1.0.3\n\nThe suite has 99 tests and is headless-safe.\n", 3)
+        self.assertEqual(len(count_line(out)), 1, f"the old phrasing is still checked: {out}")
+        self.assertIn("99", count_line(out)[0])
+        # F55's actual shape: a stale count stated WITHOUT the magic phrase. The old checker went green here.
+        rc2, out2 = verdict("# pc-eye\n\nVERSION 1.0.3\n\nThe contract is 99 tests, in three orders.\n", 3)
+        self.assertEqual(len(count_line(out2)), 1, f"a reworded README must not switch the check off: {out2}")
+        self.assertIn("99", count_line(out2)[0])
+        # the count is right and a filename is not a claim: `python3 tests/run_all.py` must not read as "3 tests"
+        rc3, out3 = verdict("# pc-eye\n\nVERSION 1.0.3\n\npython3 tests/run_all.py runs the 3 tests.\n", 3)
+        self.assertEqual(count_line(out3), [], f"paths are not counts, and 3 is the real number: {out3}")
+        # and a document may talk about tests without promising a number at all
+        rc4, out4 = verdict("# pc-eye\n\nVERSION 1.0.3\n\nThe tests are the contract.\n", 3)
+        self.assertEqual(count_line(out4), [], f"no count claimed, so nothing to complain about: {out4}")
+
+    def test_the_soak_runs_once_per_ci_job_not_once_per_pass(self):
+        """F52/F54: three passes each launching a 600-request soak made the soak the flake."""
+        root = pathlib.Path(__file__).resolve().parent
+        src = (root / "run_ordered.py").read_text(encoding="utf-8")
+        self.assertIn("PCEYE_SKIP_SOAK", src,
+                      "the ordered passes must skip the soak: the heavy timing-sensitive step belongs to the "
+                      "primary pass, or the passes fight it for ports and go red over nothing")
+        self.assertIn("serve_forever", (root.parent / "evidence" / "fuzz_protocol.py").read_text(encoding="utf-8"),
+                      "sanity: the thing being skipped is still the soak harness, not an empty stub")
+
+    def test_a_slow_connection_is_not_reported_as_a_crash(self):
+        """F54: the control question decides crash vs slow, and only socket problems get to ask it."""
+        import importlib.util
+        import urllib.error
+        path = HERE / "evidence" / "fuzz_protocol.py"          # HERE is the repo root, see the top of this file
+        self.assertTrue(path.exists(), f"the soak harness vanished from {path} — the skip test would be vacuous")
+        spec = importlib.util.spec_from_file_location("fuzzmod", path)
+        fz = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fz)                      # import must not start a soak
+        self.assertTrue(fz.transport(TimeoutError("timed out")),
+                        "a timeout is about the socket: it earns the control question instead of a crash report")
+        self.assertTrue(fz.transport(ConnectionResetError("reset")))
+        self.assertTrue(fz.transport(urllib.error.URLError(OSError("closed"))))
+        self.assertFalse(fz.transport(ValueError("bad json")),
+                         "a content error is a protocol finding; whether the server is alive is beside the point")
+        self.assertGreaterEqual(fz.REQ_TIMEOUT, 15,
+                                "the request timeout is a watchdog on a loaded runner; latency has its own "
+                                "harness (evidence/BENCH_*.json), and this one must not double as a perf gate")
+
     def test_save_seams_round_trips_a_descriptor(self):
         class C:
             @staticmethod
