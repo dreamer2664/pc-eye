@@ -1,26 +1,21 @@
 # SHIP_GATE.md — pc-eye's own gate (nothing reaches main without this green)
 
-`ship`-style contract, same rules as the agency: any `$ ` line that fails = no ship. Tier-work changes
-merge on a green gate; the code that touches a human's mouse is exactly the code that should not be
-merged by feel.
+Same contract as the agency: `ship` runs every line starting with `$ `, in order, from the repo root.
+Any failure = no ship. Merge authority follows the gate, not a manager — and the code that touches a
+human's mouse is exactly the code that should not be merged on feel.
 
-## Checks — run from the repo root
-
+$ python3 tools/check_docs.py
 $ python3 tests/run_all.py --all
-$ python3 -c "import server,launcher;assert server.VERSION in open('README.md').read();assert server.VERSION in open('CHANGELOG.md').read();print('version+docs in sync',server.VERSION)"
-$ python3 -c "import ast;s=open('server.py').read();ast.parse(s);assert 'secrets.token_hex(16)' in s;assert 'token_hex(4)' not in s;print('token policy ok')"
-$ python3 -c "
-import re
-src=open('server.py').read()
-a=set(re.findall(r'^    \"(\w+)\":', src.split('ACTIONS = {')[1].split('}')[0], re.M))
-m=set(re.findall(r'\"(\w+)\":', src.split('METHOD = {')[1].split('}')[0], re.M))
-assert a==m=={'click','move','type','key','drag','scroll','paste'}, (a,m)
-print('action schema == dispatch table ==',len(a),'actions')"
 
-## What a green gate does NOT prove (say this out loud, do not paper over it)
+## What a green gate does NOT prove — say this out loud, do not paper over it
 
-* it does not prove a click lands on the right pixel — only `/selftest`, `coord_space.consistent` and
-  `exact` on the real machine do that (this is the sentence the whole project exists around);
-* it does not run on Windows here. The `windows-latest` leg of `.github/workflows/ci.yml` is what does,
-  and it must be green on the PR before the merge counts as verified by CI rather than by Linux alone;
-* capture-side speed is counted (`evidence/capture_count.py`), not timed, on a headless box.
+* it does **not** prove a click lands on the right pixel. Only `/selftest`, `coord_space.consistent` and
+  `exact` on the real machine do that. That sentence is the whole reason this project exists.
+* it does **not** run on Windows here. `.github/workflows/ci.yml` has a `windows-latest` leg that does,
+  executing `ctypes.windll`, `ImageGrab`, `GetSystemMetrics` and the clipboard for real. A merge is
+  "verified by CI", not "verified by Linux alone", once that leg is green.
+* capture-side speed is **counted** (`evidence/capture_count.py`), not timed, on a headless box: a sandbox
+  with no display cannot honestly measure a screen grab, and pretending otherwise is the failure mode
+  this repo keeps paying for.
+* `evidence/negative_check.py` is the check that the suite is not decoration: it runs the new tests
+  against the pre-fix tree and reports how many fail. If that number is 0, the tests prove nothing.

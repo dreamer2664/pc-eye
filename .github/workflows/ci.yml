@@ -1,11 +1,15 @@
 name: ci
 
-# Why this file exists (AUDIT.md F16): the two worst bugs pc-eye ever shipped — the DPI coordinate split
-# and the truncated clipboard HANDLE — were both "invisible from Linux and obvious within minutes on the
-# real machine" (the README's own words). A windows-latest runner executes ctypes.windll, ImageGrab,
-# GetSystemMetrics and the clipboard for real, headless, with no tunnel and no token, and it can be told
-# --dry-run so nothing ever moves a pointer. That is the cheapest possible insurance for a tool whose
-# whole failure mode is "looks like it worked".
+# Why this file exists (AUDIT.md F16): the two worst bugs pc-eye ever shipped — the DPI coordinate
+# split and the truncated clipboard HANDLE — were both, in the README's own words, "invisible from Linux
+# and obvious within minutes on the real machine". A windows-latest runner executes ctypes.windll,
+# ImageGrab, GetSystemMetrics and the clipboard for real, headless, with no tunnel, no token and
+# --dry-run, so nothing can ever move a pointer from CI. That is the cheapest possible insurance for a
+# tool whose whole failure mode is "looks like it worked".
+#
+# Note on shape: keep every inline command in a block scalar. An earlier revision of this file put a
+# `python -c "...assert x: y"` on one line and GitHub failed the whole workflow at PARSE time with no
+# job, no log and no annotation — a red X on the commit and nothing to read. Scripts go in tools/.
 
 on:
   push:
@@ -25,18 +29,32 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: install Pillow (the one runtime dependency)
-        run: python -m pip install --quiet --disable-pip-version-check pillow
-      - name: suite + measurement harnesses
-        run: python tests/run_all.py --all
+
+      - name: Install the one runtime dependency
+        run: |
+          python -m pip install --quiet --disable-pip-version-check pillow
+
+      - name: Suite + measurement harnesses
+        run: |
+          python tests/run_all.py --all
         env:
           PYTHONWARNINGS: error::ResourceWarning
-      - name: the exact command a human double-clicks is importable and self-tests
+
+      - name: Docs must not drift from the code
         run: |
-          python launcher.py --help > /dev/null || python launcher.py --help > nul
-          python server.py --selftest --dry-run || echo "selftest exit non-zero: capture unavailable in CI, which is an honest red, not a fake green"
-      - name: audit doc must still match reality
-        run: python -c "import pathlib,re;s=pathlib.Path('server.py').read_text();m=re.search(r'VERSION = \"([0-9.]+)\"',s);assert m;v=m.group(1);r=pathlib.Path('README.md').read_text();c=pathlib.Path('CHANGELOG.md').read_text();assert v in r and v in c, 'version drift: '+v"
+          python tools/check_docs.py
+
+      - name: Ship gate commands, verbatim
+        run: |
+          python -c "import server,launcher;print('imports ok', server.VERSION)"
+          python server.py --version
+          python launcher.py --help
+
+      - name: Selftest on this box (a red here is honest, not a fake green)
+        continue-on-error: true
+        run: |
+          python server.py --selftest --dry-run --port 8799

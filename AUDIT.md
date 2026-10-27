@@ -180,16 +180,34 @@ Default is now `optimize=False`, with `?opt=1` (or `--optimize`) for a human sav
 when the screen is identical. Cost of a poll drops from a frame to a header.
 **Test:** `test_a_304_when_nothing_changed_saves_the_whole_frame`, `test_empty_responses_carry_no_body_bytes`.
 
-### F15 — LOW · the aim-mode request was 9× slower than it needed to be
-`?max=0` (full resolution "to aim") measured **9.08 → 7.20 ms (−21 %)** at pinned policy and
-**8.83 → 5.76 ms (−35 %)** at each build's own default, because it no longer pays for a capture it
-throws away. Documented cost stays honest: a full 1080p PNG is ~6 MB and ~294 ms on this box, so PNG is
-a save-to-disk mode, not a browsing mode.
+### F15 — LOW · the aim-mode request paid for a capture it threw away
+`?max=0` (full resolution "to aim") **9.08 → 7.20 ms (−21 %)** at pinned policy and
+**8.83 → 5.76 ms (−35 %)** at each build's own default — see the table below for the controlled numbers.
+Documented cost stays honest: a full 1080p **PNG** is ~6 MB and ~294 ms on this box (~9× the encode of a
+1440-wide JPEG), so PNG is a save-to-disk mode, not a browsing mode. `tools/check_docs.py` now refuses to
+let the docs advertise a route the server does not serve.
 
-**Route-level summary (identical policy, both trees):** `/shot` 30.84 → 31.07 ms (+0.7 %, inside noise for
-the added guards), `/act click` +0.06 ms, `/state` 0.78 → 0.75 ms. **Cost of the whole audit's safety
-work: about 0.1 ms per request. The savings are a screen capture per `/state`, a quarter of every encode,
-and a frame per idle poll.**
+**Route-level summary — a controlled A/B, not a vibe.** Same harness file run against both trees
+(`python3 evidence/bench.py --repo <tree> --no-limit`), same synthetic 1080p screen (text rows + noise),
+`n=25` medians, and the encode policy **pinned to 1.0.2's behaviour** so the only difference is the code:
+
+| route | 1.0.2 (pinned) | 1.0.3 (pinned) | each build's own default |
+|---|---|---|---|
+| `/shot` | 30.84 ms | 31.07 ms (+0.7 %) | 33.11 → **31.61 ms (−4.5 %)** |
+| `/shot?max=0` | 9.08 ms | **7.20 ms (−21 %)** | 8.83 → **5.76 ms (−35 %)** |
+| `/state` | 0.78 ms | **0.75 ms** | 0.74 → 1.05 ms |
+| `/act click` | 0.81 ms | 0.87 ms (+0.06) | — |
+
+So: **the safety work costs about 0.06 ms per request**, and the savings are a whole screen capture per
+`/state`, a quarter of every encode, and a frame per idle poll. The `/state` +0.3 ms in the last column is
+the four new guards on a request that should never have been expensive — on a real PC it is noise against
+a 30–120 ms capture it no longer performs.
+
+One honest caveat about bytes: on this deliberately noisy synthetic frame, dropping `optimize` *increases*
+size (+5.7 % on the isolated encode), while on the tiny flat-image fixture the route reports 7.0 → 18.5 KB.
+Both are properties of the test image, not of your desktop; the time saving (−25 %) is the measured,
+content-insensitive part. If you are bandwidth-bound rather than latency-bound, `?opt=1` is one parameter
+away, and it is documented as such rather than quietly defaulted.
 
 ---
 
