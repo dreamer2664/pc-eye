@@ -144,3 +144,21 @@ cannot run headless is pinned by a source-shape test or handed to the Windows CI
 First live run on CarloPC. Found and fixed the DPI coordinate split (capture 1920x1080 vs input
 1536x864, silently clamped) and the truncated `GlobalAlloc` HANDLE that crashed clipboard paste.
 32 tests.
+
+## Unreleased — 2026-10-27 (vesper): the suite was order-dependent (F43)
+
+- **Fixed**: `WindowsBehaviour` restored `Handler.input_space` / `Handler.display_rect` by reading them off the
+  class, which unwraps a `staticmethod` into a plain function — re-installing it as an *instance method* and
+  making every later `self.input_space()` call raise `TypeError`. 8 tests were red in file order and green in CI,
+  because `unittest discover` sorts classes alphabetically and pytest does not. New `save_seams` / `restore_seams`
+  helpers preserve the descriptor; three patch sites now use them.
+- **Fixed**: the fuzz harness left its 1920x1080 geometry stubs welded onto `Handler` forever, so anything after
+  it in the same process tested against invented geometry and passed anyway.
+- **Added** `tests/run_ordered.py`: runs the module in source order (classes read out of the AST — pytest is not
+  a dependency here), and `tests/run_all.py` now runs it *and* `unittest discover`. A gate that samples one order
+  of a suite with shared state is a coin flip. `ZSeamIntegrity` asserts the seam shape in either order; with the
+  old bare restore put back, that class turns both runners red (verified: source order 1 failure + 9 errors,
+  alphabetical 2 failures), so the guard has teeth and does not merely document.
+- **Docs**: README's test count regenerated (79 → 82) by `tools/check_docs.py`, which is the check that flagged
+  it; SHIP_GATE now says to run both orders.
+- Not fixed, logged: `free_port()`'s bind-then-close TOCTOU (two classes can pick the same port).

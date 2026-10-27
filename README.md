@@ -92,7 +92,7 @@ test box — a save-to-disk mode, not a browsing mode.
 
 ```
 python tests/run_all.py                       # the suite, and what CI runs
-python -m unittest discover -s tests          # 79 tests, headless-safe
+python -m unittest discover -s tests          # 82 tests, headless-safe
 python evidence/bench.py --no-limit           # timings (needs a display for capture-side numbers)
 python evidence/capture_count.py              # pixel work per request, old tree vs new
 python evidence/negative_check.py             # proves the regression tests fail on 1.0.2
@@ -133,7 +133,7 @@ All three are checked by a machine (`tools/check_docs.py`, plus the pre-commit h
 
 ## How the protocol was tested, and why there is a fuzzer in `evidence/`
 
-`tests/test_pc_eye.py` (79 tests) is the contract. `evidence/fuzz_protocol.py` is the generator that found
+`tests/test_pc_eye.py` (82 tests) is the contract. `evidence/fuzz_protocol.py` is the generator that found
 six more bugs the contract did not describe — four of them in code written during the 1.0.3 audit itself,
 including `/shot?fmt=png&quality=50` raising `UnboundLocalError` inside the handler. Two properties it
 checks that a hand-written list never would: **the server always answers** (a bad argument is a 400 with a
