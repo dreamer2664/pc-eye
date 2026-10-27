@@ -49,3 +49,9 @@ fixed. So `run_all.py` runs three passes over the suite: alphabetical (what CI d
 class alone in its own process (`--isolated`), which is the one that catches an assertion that needs company. If you add a test class that patches anything on `pceye.Handler`, save and restore it with
 `tests/test_pc_eye.py:save_seams/restore_seams` (a `staticmethod` read off a class is not a `staticmethod`
 written back) and make sure `ZSeamIntegrity` still passes in both orders.
+
+**A gate step may not be a test inside the run it gates.** F52: the guard for F43 asserted the ordered pass was
+green by re-running the whole suite in a subprocess from within a test method, and it went red on a Windows leg
+at a docs-only commit — not because anything was broken, but because two suite runs on one runner oversubscribe
+ports and timing. Flaky checks are worse than none: they train the crew to re-run and ignore. Assert structure
+(`run_all.py` contains the passes; the orders differ); run the passes themselves once, as steps.

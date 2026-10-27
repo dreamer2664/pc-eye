@@ -1100,23 +1100,37 @@ class ZSeamIntegrity(unittest.TestCase):
         self.assertNotIn("absent", C.__dict__, "a name that was not there must not be created by restoring")
 
     def test_the_two_runners_agree_about_class_order(self):
-        """The finding, pinned: an order-dependent bug needs a runner that can be bitten by it.
+        """The gate must contain BOTH orders, and here the two orders must genuinely differ.
 
-        `run_ordered.py` exists so the gate contains at least one pass in source order. If somebody later
-        "simplifies" the gate back to a single `unittest discover`, this test says out loud what was lost.
+        This used to shell out to `tests/run_ordered.py` and assert it was green. That was a mistake of the same
+        family as everything else in this file: a whole second suite run, with its own servers and ports, living
+        inside one test method — doubling the ephemeral-port and timing pressure on a CI runner. On
+        `windows-latest, 3.13` at a docs-only commit it produced exactly one failure, in this test, about the
+        nested run being red, while the same nested run was green as its own gate step. A guard that fails
+        sometimes is worse than no guard, because the crew learns to ignore it (AUDIT.md F52).
+
+        So assert the structure, not the outcome — which is also the only thing a unit test can know:
         """
-        import subprocess
-        import sys
-        if os.environ.get("PCEYE_ORDERED"):
-            # run_ordered.py sets this for its own process; without the guard, each runner would spawn the
-            # other and the suite would recurse until the box ran out of processes
-            self.skipTest("already inside the ordered pass — the recursion guard")
-        root = pathlib.Path(__file__).resolve().parent.parent
-        r = subprocess.run([sys.executable, str(root / "tests" / "run_ordered.py")],
-                           capture_output=True, text=True, cwd=str(root), timeout=600,
-                           env={**os.environ, "PCEYE_ORDERED": "1"})
-        self.assertEqual(r.returncode, 0, f"source-order pass is red:\n{(r.stdout or '')[-1500:]}")
-        self.assertIn("green", r.stdout, r.stdout[-400:])
+        import ast as _ast
+        here = pathlib.Path(__file__).resolve().parent
+        gate = (here / "run_all.py").read_text(encoding="utf-8")
+        self.assertIn("run_ordered.py", gate,
+                      "the gate lost the source-order pass; that is how F43 came back")
+        self.assertIn("--isolated", gate,
+                      "the gate lost the per-class isolation pass; that is how F44 came back")
+        self.assertIn('"discover"', gate, "the alphabetical order is CI's; keep running it too")
+
+        # and prove the two orders are not the same order for this file — if they ever coincide, the second
+        # pass buys nothing and this test should be deleted instead of quietly kept
+        src = [n.name for n in _ast.parse((here / "test_pc_eye.py").read_text(encoding="utf-8")).body
+               if isinstance(n, _ast.ClassDef) and any("TestCase" in _ast.unparse(b) for b in n.bases)]
+        alpha = sorted(src)
+        self.assertNotEqual(src, alpha,
+                            "source order == alphabetical order, so the ordered pass proves nothing new")
+        poison, victim = "WindowsBehaviour", "RegressionV103"
+        self.assertLess(src.index(poison), src.index(victim),
+                        f"{poison} must precede {victim} in the file, or the F43 shape is untested again")
+
 
 
 
