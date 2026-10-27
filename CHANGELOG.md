@@ -1,0 +1,68 @@
+# CHANGELOG — pc-eye
+
+Append-only. Correcting an old entry means adding a new one, not editing history.
+
+## 1.0.3 — 2026-10-27 (vesper)
+
+**Whole-process audit + hardening. `AUDIT.md` is the record; this is the summary.**
+26 findings (F1–F26): 6 CRIT, 8 HIGH. Every one is either fixed with a named regression test or reported
+with a recommendation. `evidence/negative_check.py` proves **26 of the 28 new tests fail against 1.0.2**.
+
+### A confident lie became a refusal
+* **F1** `/act` now **stops** when the eyes and the hand are in different coordinate spaces (the prose
+  promised this since 1.0.1; the code only bounds-checked). `coord_gate()` is pure → unit-testable.
+* **F2** a `paste` the clipboard refused returned `200 {"ok":true}`; it is now a 409 that says NOT pasted.
+* **F3** `--dry-run` was invisible: `dry_run` now appears in `/state`, `/act`, `/selftest` (+ a `TEST-MODE`
+  check), in the log, and on the console banner.
+* **F4** `key` could not type punctuation and did not validate `times`; single characters now always go
+  through `KEYEVENTF_UNICODE` (shift-free, exact).
+* **F5** `/selftest` reported an impossible log path as writable; it now proves the log **by writing it**.
+* **F6** an off-screen `region` returned black (reads as "empty desktop"); refused as 400 — and a second
+  monitor at **negative** coordinates is now described instead of refused.
+
+### Doors closed
+* **F7** token: 8 hex (32 bits) → **32 hex (128 bits)**; a short `--token` is warned about and graded red
+  by `/selftest`. **No token may ever be posted to a wire, a chat log or a screenshot.**
+* **F8** `/act` requires `Content-Type: application/json` (a browser cannot fake that without a preflight)
+  and refuses a foreign `Origin` with 403. 1.0.2 accepted a cross-origin `text/plain` POST = CSRF.
+* **F9** bounds on everything: type 20k chars, key `times` 100, paste 200k, body 1 MB (413);
+  `/act` 120/min and `/shot` 180/min (429 **with a remedy**), failing **open**.
+* **F10** four crash paths that looked exactly like a dead PC (`?max=abc`, a list body, a string
+  coordinate, `ctypes.windll` on Linux) are 400s that name the field.
+
+### Faster, measured (`evidence/BENCH_*.json`, `evidence/CAPTURE_COUNT.txt`)
+* **F12** `/state` grabbed the whole screen to read a width → asks the OS, cached 20 s.
+  On a real PC: **2 pixel captures per look+check cycle → 1**; `/selftest` 2 → 1.
+* **F13** `optimize=True` on every shot cost 25 % of the encode for 5 % of the bytes → default off,
+  `?opt=1` back. **42.62 ms → 31.81 ms** on an identical 1080p frame.
+* **F14** `X-Screen-Hash` + `GET /shot?changed=HASH` → **304 with no body**: watching a build now costs a
+  header instead of a frame.
+* **F15** `?max=0` (aim mode) **−21 %** at pinned policy, **−35 %** at each build's own default.
+* Cost of all the new safety work: **~0.1 ms per request** (`/shot` +0.7 %, inside noise).
+
+### The launch path
+* **F16** added `tests/run_all.py` and `.github/workflows/ci.yml` with a **windows-latest** leg — the leg
+  that actually executes the ctypes/ImageGrab/clipboard paths the two historical bugs hid in.
+* **F17** `start_tunnel` could block 45 s silently and left cloudflared running after Ctrl+C; it now
+  reports progress and terminates the tunnel on timeout and on exit.
+* **F18** the downloaded cloudflared is validated (size + `MZ`/`ELF` header) before being executed.
+* **F19** a busy port said `[Errno 10048]`; now it binds deliberately, moves up and says so
+  (`build(..., sock=)`), or names pc-eye as the likely occupant.
+* **F20** `move seconds=` was accepted and ignored (now real, capped); `drag` released ~1 px short of
+  `x2,y2` (now lands exactly before the button-up).
+* `--version` added; `VERSION` matches README/CHANGELOG (a test pins it); unused `base64` import removed.
+
+### Tests
+32 → **67**, still headless-safe. `Handler.input_space` / `Handler.display_rect` are now named seams, so
+the Windows behaviour is exercised through the real routes instead of around them.
+
+### Not changed, on purpose
+the token-as-only-lock threat model (pairing/HMAC would break "paste two lines and work"); the proven
+`SetCursorPos`/`mouse_event`/`keybd_event` primitives; and no Windows-only path was "fixed" blind — what
+cannot run headless is pinned by a source-shape test or handed to the Windows CI leg.
+
+## 1.0.2 — 2026-10-16
+
+First live run on CarloPC. Found and fixed the DPI coordinate split (capture 1920x1080 vs input
+1536x864, silently clamped) and the truncated `GlobalAlloc` HANDLE that crashed clipboard paste.
+32 tests.

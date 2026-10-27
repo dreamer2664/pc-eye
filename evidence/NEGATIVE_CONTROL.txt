@@ -1,0 +1,34 @@
+old code (bb68297) vs the new RegressionV103 suite:
+  ran 29 · caught 28 (28/29 of the new tests fail WITHOUT the fix)
+    ✗ test_a_304_when_nothing_changed_saves_the_whole_frame
+    ✗ test_a_cross_origin_post_from_a_web_page_is_refused
+    ✗ test_a_failed_paste_never_reports_ok
+    ✗ test_a_json_list_or_string_body_is_a_400_not_a_dead_connection
+    ✗ test_a_non_numeric_coordinate_is_named_not_crashed
+    ✗ test_a_non_numeric_max_is_a_400_that_names_the_field
+    ✗ test_a_non_windows_box_still_answers_instead_of_dropping_the_connection
+    ✗ test_a_paste_the_clipboard_refused_is_an_error_not_a_200
+    ✗ test_a_second_monitor_at_negative_coordinates_is_not_refused
+    ✗ test_a_spinning_agent_is_stopped_and_told_why
+    ✗ test_an_out_of_screen_region_is_refused_instead_of_arriving_black
+    ✗ test_display_rect_is_cached_and_expires
+    ✗ test_drag_releases_on_the_exact_endpoint
+    ✗ test_dry_run_is_visible_in_state_act_and_selftest
+    ✗ test_empty_responses_carry_no_body_bytes
+    ✗ test_key_times_is_bounded
+    ✗ test_move_seconds_is_recorded_and_capped
+    ✗ test_paste_is_bounded
+    ✗ test_quality_and_opt_are_actually_honoured
+    ✗ test_selftest_grades_the_token_length
+    ✗ test_selftest_proves_the_log_by_writing_it
+    ✗ test_state_answers_without_touching_the_screen
+    ✗ test_the_default_token_has_128_bits
+    ✗ test_the_docs_describe_only_routes_that_exist
+    ✗ test_the_method_and_action_tables_still_match
+    ✗ test_the_real_screen_class_asks_the_os_before_it_grabs
+    ✗ test_type_is_bounded_and_says_why
+    ✗ test_version_in_the_code_matches_the_readme_and_changelog
+  passed on old code too (1) — these pin contract, not fix:
+    = test_a_local_page_on_the_same_host_is_still_allowed
+
+VERDICT: the regression tests DO catch the flaws they claim to

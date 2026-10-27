@@ -8,8 +8,8 @@ screen and *act* on it, through a tunnel you start yourself. No API keys, nothin
 and the off switch is the console window you can close.
 
 ```
-GET  /state      screen size, cursor, uptime, last action, coordinate-space check
-GET  /shot       the screen, as an image the agent looks at
+GET  /state      screen size, cursor, uptime, last action, coordinate-space check  (no pixel capture)
+GET  /shot       the screen, as an image the agent looks at (+ X-Screen-Hash; ?changed=HASH -> 304)
 POST /act        one action: click / move / type / key / drag / scroll / paste
 GET  /selftest   what this machine can and cannot do, reported honestly
 ```
@@ -20,8 +20,13 @@ Double-click **`start.bat`** (install Pillow once if asked). It prints two lines
 
 ```
 URL:   https://<something>.trycloudflare.com
-TOKEN: 8 hex characters
+TOKEN: 32 hex characters        <- 128 bits; the token is the ONLY lock on the door
 ```
+
+The token is a bearer secret that rides in a query string (`?t=`), so it lands in browser history and in
+whatever proxy is between you and the tunnel. **Paste it to the agent in the chat that owns the session,
+never to a wire, a group channel, a screenshot or a commit.** `--token` can still set a shorter one;
+`/selftest` will grade that red and the server will say so at startup.
 
 Give those to the agent, and give it **[`PC-EYE.md`](PC-EYE.md)** — that file is the instruction set it
 follows. Everything else is in there: the look–decide–act–look-again loop, the coordinate arithmetic between
@@ -60,18 +65,54 @@ Nothing here had ever executed on a Windows machine until it was driven end-to-e
    and the write faulted at `0x...20`. Fixed by declaring every argument and return type, and freeing the
    block only when the clipboard did not take ownership.
 
-Both failures were invisible from Linux and obvious within minutes on the real machine.
+Both failures were invisible from Linux and obvious within minutes on the real machine. **That asymmetry
+is now a CI leg** (`.github/workflows/ci.yml` runs `windows-latest`, where `ctypes.windll`, `ImageGrab`
+and the clipboard actually execute) — because "we found it by hand at 23:00 through a chat window" is not
+a test strategy. See `AUDIT.md` F16.
+
+## Speed, measured (1.0.3)
+
+The loop is look → decide → act → look again, so the cost that matters is per-request, in milliseconds,
+on the human's upload. `evidence/bench.py` + `evidence/CAPTURE_COUNT.txt` hold the raw numbers; the
+before/after ran the **same harness on both trees**.
+
+| | 1.0.2 | 1.0.3 |
+|---|---|---|
+| pixel captures per `/state` (geometry known) | 1 full-screen grab | **0** (asks the OS, cached 20 s) |
+| captures per look+check cycle | 2 | **1** |
+| JPEG encode, 1080p→1440 q72 | 42.62 ms / 481 KB | **31.81 ms** / 509 KB (`optimize` default off, `?opt=1` to restore) |
+| aim mode `?max=0` | 8.83 ms | **5.76 ms** |
+| watching a build (poll) | one frame per look | **304, no body** (`?changed=HASH`) |
+| cost of the new safety checks | — | **~0.1 ms/request** |
+
+Known trap, kept honest rather than hidden: `?fmt=png` at full resolution costs ~294 ms and ~6 MB on the
+test box — a save-to-disk mode, not a browsing mode.
 
 ## Tests
 
 ```
-python -m unittest discover -s tests        # 32 tests, headless-safe
+python tests/run_all.py                       # the suite, and what CI runs
+python -m unittest discover -s tests          # 67 tests, headless-safe
+python evidence/bench.py --no-limit           # timings (needs a display for capture-side numbers)
+python evidence/capture_count.py              # pixel work per request, old tree vs new
+python evidence/negative_check.py             # proves the regression tests fail on 1.0.2
 ```
 
 They cover the routes, the token, the action contract, the refusals, the log, the coordinate-space verdict
 (the 1920x1080 / 1536x864 case is a regression test), the chord resolution and the dry-run behaviour. They
 cannot prove that a click lands on the right pixel on *your* Windows box — `/selftest` and the `exact` field
 on every action are what tell you that, on the machine itself.
+
+## Limits a person should know before trusting an agent with it (1.0.3)
+
+* **Every action is bounded**: 20,000 characters per `type`, 100 `times` per key, 1 MB per request,
+  120 actions and 180 shots per minute. A runaway agent loop is stopped with a 429 that says what to do
+  instead — and the limiter fails *open*, so it can never lock you out of your own machine.
+* **`/act` refuses a browser that is not on this host** (403/415). A page on your own browser cannot drive
+  the PC just because it saw the URL.
+* **A split coordinate space is a refusal, not a warning.** If DPI awareness ever fails to take, `/act`
+  answers 409 on anything that aims the pointer, instead of clicking confidently on the wrong thing.
+* **Dry-run says so.** `--dry-run` replies carry `dry_run: true` and a `TEST-MODE` selftest line.
 
 ## Known limits, stated rather than hidden
 

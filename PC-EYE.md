@@ -9,7 +9,9 @@ URL:   https://<something>.trycloudflare.com      <- paste here
 TOKEN: 8 hex characters                            <- paste here
 ```
 
-They are also saved on the PC as `READY.txt` in the same folder. If the URL contains no `trycloudflare.com`,
+They are also saved on the PC as `READY.txt` in the same folder. The token is 32 hex characters now: it is the
+only lock on a door that faces the open internet, and it travels in a URL. Never repeat it in a public place,
+and never send it to a wire. If the URL contains no `trycloudflare.com`,
 the tunnel did not come up and the human must tell you — nothing outside that PC can reach it, and no amount
 of clever requests will change that.
 
@@ -17,10 +19,23 @@ Everything you do goes through these routes. Every request needs the token: `?t=
 
 | Route | What it does |
 |---|---|
-| `GET /state` | screen size, cursor position, uptime, last action, `coord_space`, `dpi`, whether capture works |
-| `GET /shot` | **the screen, as an image you can look at** — this is your eyes |
+| `GET /state` | screen size, cursor position, uptime, last action, `coord_space`, `dpi`, `dry_run`, whether capture works — **no pixel capture, poll it freely** |
+| `GET /shot` | **the screen, as an image you can look at** — this is your eyes. Params: `max`, `quality` (1–95), `fmt` (jpeg/png), `region`, `opt` (0/1), `changed` |
 | `POST /act` | exactly one action: click, move, type, key, drag, scroll, paste |
 | `GET /selftest` | what this machine can actually do, including what it cannot |
+
+Two things worth knowing before your first request, both from the 1.0.3 audit:
+
+* **`dry_run: true` in any reply means this PC is not being touched at all** — the human started the server
+  in demo mode. Report that and stop; do not narrate actions that were only recorded.
+* **`X-Screen-Hash`** comes back on every `/shot`. While you are waiting for something to finish (a build,
+  an install, a page load), poll `GET /shot?changed=<hash>`: you get **304 with no body** when the screen is
+  identical, which is what an agent should be doing instead of pulling a hundred frames. A loop that pulls
+  faster than ~3 shots/second is refused with **429** — and the 429 tells you to use this.
+
+`POST /act` demands `Content-Type: application/json`. A browser could otherwise send you a form POST from
+any page the human happens to have open; that is now refused (415/403), so a real client must state what
+it is sending.
 
 ## Before anything else: the coordinate check
 
@@ -67,13 +82,16 @@ to (700 * 1920/1440, 300 * 1080/810) = (**933, 400**). Getting this wrong is the
 clicks confidently on the wrong pixel — check it once per session, not per click.
 
 Simpler and safer: `GET /shot?max=0` for a 1:1 full-resolution image when precision matters (it is bigger and
-slower, so use it to aim, not to browse).
+slower, so use it to aim, not to browse). If you want a *smaller* image rather than a sharper one, that is now
+a real parameter — `GET /shot?quality=45` — because in 1.0.2 `quality=` was silently ignored and you got the
+default anyway. Use `?fmt=png` only when you truly need lossless: full-resolution PNG costs roughly 9× the
+encode time and 12× the bytes of the default JPEG, which on a home upload is a minute, not a millisecond.
 
 ## Actions
 
 ```jsonc
 POST /act?t=TOKEN   {"action":"click","x":640,"y":480}              // optional: button, clicks, double
-                    {"action":"move","x":640,"y":480}               // optional: seconds (ease to the point)
+                    {"action":"move","x":640,"y":480,"seconds":0.4} // ease to the point (real, capped at 5s)
                     {"action":"type","text":"hello"}               // unicode-capable, no clipboard
                     {"action":"key","key":"enter"}                  // or a chord: "ctrl+s", "alt+f4"
                     {"action":"drag","x":1,"y":2,"x2":300,"y2":400}
@@ -92,19 +110,28 @@ Response: `{"ok":true,"action":"click","did":{...},"cursor":[x,y],"landed":[x,y]
   re-read `/state` → `coord_space`, and do not report the action as done.
 
 The reply never echoes your text back — that is deliberate, and you should not put secrets in the same request
-you would paste into a chat.
+you would paste into a chat. `paste` failing is now an error (409 "the text was NOT pasted"), not a 200 with
+`pasted: false` inside it: in 1.0.2 the agent read `ok` and reported a field as filled when the clipboard had
+been busy. When `paste` returns `pasted: true`, that means the clipboard accepted the text and Ctrl+V was
+sent — it still does not mean the target field received it. Check with your eyes.
 
 ## When something is refused — read the sentence, act on it
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `400` | you made an argument mistake (typo field, bad region, unknown key) | the error names it; fix and retry |
+| `400` | you made an argument mistake (typo field, bad region, unknown key, `max=abc`, body not an object) | the error names the field; fix and retry |
 | `401` | wrong or missing token | ask the human to re-check the two lines |
-| `409` | forbidden, impossible, or a coordinate the hand cannot reach (would clamp) | do not retry — tell the human |
+| `403` | a browser on another site tried to drive the PC | not yours to fix; tell the human |
+| `409` | forbidden, impossible, a coordinate the hand cannot reach, **or the eyes and hand are in different spaces** | **do not retry, do not guess a scale factor** — tell the human |
+| `413` | request body too large (1 MB) | send smaller, or in pieces |
+| `415` | `/act` body was not `application/json` | set the header; a web page cannot, which is the point |
+| `429` | your loop is spinning (120 actions/min, 180 shots/min) | slow down; use `/shot?changed=` while waiting |
+| `503` | the machine could not do it (no display, capture failed, clipboard busy) | the error explains; tell the human if it persists |
 
-Chords take named keys and single letters/digits: `ctrl+t`, `ctrl+shift+n`, `alt+f4`, `win+r`, `ctrl+alt+del`
-refused as above.
-| `503` | the machine could not do it (no display, capture failed) | the error explains; tell the human if it persists |
+Chords take named keys and single letters/digits: `ctrl+t`, `ctrl+shift+n`, `alt+f4`, `win+r`. A single
+character (`-`, `/`, `.`, `;`) is a real key now — 1.0.2 accepted those and typed nothing. `ctrl+alt+del`
+is refused as above, and so is anything that would hold the keyboard longer than it should: `type` caps at
+20,000 characters (use `paste`), `key times` at 100.
 
 Known hard limits, all reported honestly rather than faked:
 
@@ -117,7 +144,8 @@ Known hard limits, all reported honestly rather than faked:
 
 ## Your eyes must be honest
 
-Before your first action, call `GET /selftest` and **state out loud what came back**, including anything red.
+Before your first action, call `GET /selftest` and **state out loud what came back**, including anything red
+(including `TEST-MODE` if it is there — that one means nothing you do will reach the machine).
 If `/shot` fails, you are blind — say that in the chat and stop. Do not narrate actions you cannot see,
 and do not call a task done when the only evidence is that your own request returned 200.
 
