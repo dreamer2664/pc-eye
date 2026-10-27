@@ -1,0 +1,4 @@
+# Line endings and modes, so a clone on Windows cannot break a shell script or lose a bit:
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.py   text eol=lf
