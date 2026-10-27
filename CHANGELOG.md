@@ -177,3 +177,13 @@ First live run on CarloPC. Found and fixed the DPI coordinate split (capture 192
   cannot load (verified both ways, including a deliberately broken import).
 - Gate: `python3 tests/run_all.py` is 4 steps — `unittest discover` (alphabetical, as CI), source order, each
   class alone, docs check.
+## Unreleased — 2026-10-27 (vesper): the guard was a flake (F52)
+
+- `ZSeamIntegrity.test_the_two_runners_agree_about_class_order` no longer shells out to the full suite. It was
+  red on `windows-latest, 3.13` at a docs-only commit — one failure, in the guard, about a nested run, while the
+  same nested run passed as its own gate step. Nesting a whole suite (servers + `free_port()` each) inside a test
+  method oversubscribes a shared runner. Now it asserts the gate's structure (both orders + the isolation pass
+  present, source order ≠ alphabetical here, poison before victim in the file): deterministic, 0.015s, and it
+  still fails loudly if a pass is removed.
+- Rule recorded: a test may not re-run the suite; anything that needs a whole run's outcome is a gate step, and a
+  gate step may not be a test inside the run it gates.

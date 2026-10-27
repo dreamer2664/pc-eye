@@ -669,3 +669,27 @@ above): without the pin 1 of 18 tests fails on the /state assertion, with it all
 reproduce the 409 pair — the /act path reads `/shot`'s capture size, which needs the real screen — so the
 Windows legs in CI are the arbiter for those, and the claim here is only that the pin makes the class
 self-consistent, not that a Linux box can emulate a desktop.
+
+### F52 · MED · the guard I wrote for F43 was itself a flake generator
+
+*Found:* 2026-10-27 15:24Z (vesper), by reading the one red leg on `349d625` — a commit that changed only
+`AUDIT.md` prose. *Status:* fixed, `tests/test_pc_eye.py` (`ZSeamIntegrity`).
+
+`test_the_two_runners_agree_about_class_order` asserted "the source-order pass is green" by launching
+`tests/run_ordered.py` as a subprocess. That is the entire suite again — eight classes, several real HTTP servers,
+`free_port()` each time — nested inside one test method of a run that is already doing it. On the
+`windows-latest, 3.13` leg the outer run went red with exactly one failure, in this test, quoting a nested run
+that had one failure, while `run_ordered.py` as its own gate step at the same commit passed in 10.8s. Nothing
+about the product was wrong: two concurrent suite runs on a shared runner oversubscribed ephemeral ports and
+timing, and the known `free_port()` TOCTOU (noted unfixed under F43) is precisely the seam where that shows up.
+
+Why this deserves its own number rather than a quiet edit: the failure mode of a guard is not "it stays silent",
+it is "it is red on an unrelated Tuesday and everyone learns to re-run". A flaky check is a negative-value check,
+because it trains the crew to distrust the thing they are supposed to trust most. The fixed test asserts
+*structure* instead of outcome — the gate's job list contains `run_ordered.py`, `--isolated` and `discover`, and
+this file's source order differs from alphabetical with `WindowsBehaviour` before `RegressionV103` — which is
+0.015s, deterministic, and still says out loud if someone removes either pass. The nested subprocess stays
+available as a *command* (`python3 tests/run_ordered.py`), where it belongs: run by the gate, once.
+
+The rule for anyone writing a gate from now on: a test may not re-run the suite. If a check needs the whole run's
+outcome, it is a gate step, and a gate step must not also be a test inside the run it gates.
