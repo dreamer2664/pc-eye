@@ -135,8 +135,14 @@ class Protocol(unittest.TestCase):
         # had welded a `display_rect` stub onto the shared handler and happened to run first under unittest's
         # alphabetical loader. Pin the seam this test actually asserts about, and put it back: an assertion that
         # means one thing on Linux and another on Windows is not a cross-platform test (AUDIT.md F44).
-        cls._seams = save_seams(srv.RequestHandlerClass, "display_rect")
+        # BOTH seams, not just the one /state reads: /act compares the capture size against `input_space`, and
+        # on a real desktop that comparison is 1920x1080 vs 1024x768 — the coordinates gate answers 409 and
+        # every dispatch test in this class fails for a reason it never meant to test (CI's windows-latest legs
+        # said exactly that on the commit that pinned display_rect alone). A class that fakes a screen must fake
+        # the whole space it is asserting inside.
+        cls._seams = save_seams(srv.RequestHandlerClass, "display_rect", "input_space")
         srv.RequestHandlerClass.display_rect = staticmethod(lambda force=False: [0, 0, 1920, 1080])
+        srv.RequestHandlerClass.input_space = staticmethod(lambda: [1920, 1080])
         cls.srv = srv
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         cls.c = Client(f"http://127.0.0.1:{cls.port}", cls.token)
