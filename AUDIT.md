@@ -541,3 +541,35 @@ Two meta-findings, because they are the useful part:
   (`Error|Exception|Interrupt|Exit|Warning|Failure`), which is what immediately surfaced
   `NameError: name 'self' is not defined` on the next run. An oracle that cannot see a class of failure is
   worse than no oracle: it makes the silence look audited.
+---
+
+## F42 — MED · the repo read its own source with the platform's default codec (windows-latest leg)
+
+After F41 the only two Windows reds left were *my* tests, both the same line, and it was not the protocol:
+
+    tests/test_pc_eye.py:596: src = pathlib.Path(pceye.__file__).read_text()
+    encodings/cp1252.py, line 23, in decode → UnicodeDecodeError
+
+`server.py` legitimately contains em-dashes and arrows (a refusal must read like a sentence an operator
+recognises, not a stack frame), and Windows' default text encoding is cp1252. Any code in this repo that
+reads or writes its own files without naming an encoding is therefore **correct on Linux and broken on
+Windows** — including the ship-gate evidence script: `evidence/negative_check.py` did
+`write_text(...)` of that same source into a tmp file, which on Windows is `UnicodeEncodeError` at the exact
+moment a human is trying to prove the suite catches real bugs.
+
+Fixed all six reads and two writes, then made it unrepeatable: `tools/check_docs.py` now walks every `.py` in
+the repo with `ast` and fails if `read_text`/`write_text`/`open` touches a text file without `encoding=`.
+
+Two lessons from building the gate, both about my own tooling rather than the product:
+
+* **My first version was a regex over characters** that scanned for the closing paren of each call. It had an
+  off-by-one and reported `(e` as the argument list — so it flagged the *already-fixed* lines and, worse, in
+  another shape would have flagged nothing at all. A gate whose failure list is nonsense is worse than no
+  gate: it gets switched off (agency F15/F27). Rewritten as an `ast` walk; it cannot misparse what it parses.
+* **The gate found a bug I had not looked for** (`negative_check.py`'s write) on its first honest run, and it
+  found a false alarm in itself on that same run (`open(os.path.join(ROOT, name)` with `encoding=` on the
+  next line). Both are why the rule is "the check ships with its negative control": the tests asserting
+  *2/2 caught, 4/4 skipped* are part of this finding — a "flag everything" check would have gone green.
+
+Cross-platform rule, written down because the repo keeps relearning it: on this project, `open()`/`read_text`
+without `encoding=` is a bug even when the code is Linux-only, because the CI leg is not.

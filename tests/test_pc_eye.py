@@ -243,7 +243,7 @@ class Protocol(unittest.TestCase):
         self.assertEqual(code, 200)
         self.c.get("/shot", raw=True)
         self.assertTrue(log.exists(), "no log file: nothing would be reviewable afterwards")
-        text = log.read_text()
+        text = log.read_text(encoding="utf-8", errors="replace")
         self.assertIn("act click", text)
         self.assertIn("shot", text)
 
@@ -593,7 +593,7 @@ class RegressionV103(unittest.TestCase):
     def test_drag_releases_on_the_exact_endpoint(self):
         """18 steps with int() truncation used to let go up to a pixel short of x2,y2 — the drag itself
         was the reason /act had an off-by complaint in the field."""
-        src = pathlib.Path(pceye.__file__).read_text()
+        src = pathlib.Path(pceye.__file__).read_text(encoding="utf-8")
         body = src.split("def drag(")[1]
         self.assertIn("for i in range(1, steps):", body, "the interpolated path must stop short of the end")
         self.assertIn("SetCursorPos(int(x2), int(y2))", body, "and then land exactly before the button-up")
@@ -643,7 +643,7 @@ class RegressionV103(unittest.TestCase):
             pceye.SYSTEM, pceye.Input._clipboard_set_windows = orig_sys, orig_clip
 
     def test_a_failed_paste_never_reports_ok(self):
-        src = pathlib.Path(pceye.__file__).read_text()
+        src = pathlib.Path(pceye.__file__).read_text(encoding="utf-8")
         route = src.split("if action == \"paste\":")[1].split("except RuntimeError")[0]
         self.assertIn("raise RuntimeError", route, "the route must turn a False paste into an error")
         self.assertNotIn('"pasted": self.inp.paste', route)
@@ -661,7 +661,7 @@ class RegressionV103(unittest.TestCase):
     def test_the_default_token_has_128_bits(self):
         """`secrets.token_hex(4)` = 32 bits, on an internet-reachable endpoint, with no lockout, for a
         tool that types into the human's windows. The URL is handed out in a chat; 32 bits is a afternoon."""
-        src = pathlib.Path(pceye.__file__).read_text()
+        src = pathlib.Path(pceye.__file__).read_text(encoding="utf-8")
         self.assertIn("secrets.token_hex(16)", src)
         self.assertNotIn("token_hex(4)", src)
         self.assertIn("if len(token) < 16", src)     # and it warns when a human insists on a weak one
@@ -754,10 +754,10 @@ class RegressionV103(unittest.TestCase):
 
     # ---- F14: the docs and the code must not drift apart ----
     def test_version_in_the_code_matches_the_readme_and_changelog(self):
-        readme = pathlib.Path(HERE, "README.md").read_text()
+        readme = pathlib.Path(HERE, "README.md").read_text(encoding="utf-8")
         self.assertIn(pceye.VERSION, readme, "README carried 1.0.2 while server.py said 1.0.0")
         self.assertTrue(os.path.exists(os.path.join(HERE, "CHANGELOG.md")))
-        self.assertIn(pceye.VERSION, pathlib.Path(HERE, "CHANGELOG.md").read_text())
+        self.assertIn(pceye.VERSION, pathlib.Path(HERE, "CHANGELOG.md").read_text(encoding="utf-8"))
 
     def test_the_method_and_action_tables_still_match(self):
         self.assertEqual(set(pceye.METHOD), set(pceye.ACTIONS), "an action in the schema with no "
@@ -768,7 +768,8 @@ class RegressionV103(unittest.TestCase):
     def test_the_docs_describe_only_routes_that_exist(self):
         """PC-EYE.md is the agent's whole instruction set: a route named there that the server does not
         serve sends the agent off to debug its own syntax."""
-        doc = pathlib.Path(HERE, "PC-EYE.md").read_text() + pathlib.Path(HERE, "README.md").read_text()
+        doc = (pathlib.Path(HERE, "PC-EYE.md").read_text(encoding="utf-8")
+               + pathlib.Path(HERE, "README.md").read_text(encoding="utf-8"))
         documented = set(re.findall(r"(?:GET|POST) (/[a-z_]+)", doc))
         served = {"/state", "/shot", "/act", "/selftest", "/favicon.ico", "/"}
         self.assertEqual(documented - served, set(), f"documented but not served: {documented - served}")
@@ -1210,7 +1211,7 @@ class Launcher(unittest.TestCase):
             srv.shutdown(); srv.server_close(); pceye.Handler._close_log()
 
     def test_the_launcher_uses_a_128_bit_token_by_default(self):
-        src = pathlib.Path(HERE, "launcher.py").read_text()
+        src = pathlib.Path(HERE, "launcher.py").read_text(encoding="utf-8")
         self.assertIn("secrets.token_hex(16)", src)
         self.assertNotIn("token_hex(4)", src)
         self.assertIn("tunnel.terminate()", src), "closing the window must close the tunnel too"

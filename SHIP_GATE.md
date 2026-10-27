@@ -15,12 +15,15 @@ $ python3 evidence/fuzz_protocol.py --requests 20000 --seed 7
 `tools/git-hooks/pre-commit` refuses any commit made on `main`. It is not part of the gate's `$` lines
 (a gate cannot install itself), but it is the reason the rule below is now mechanical rather than moral.
 
-## The two git rules this file is run under (F39, learned the expensive way today)
+## The three git/PC rules this file is run under (F39, F42 — learned the expensive way)
 
 * A commit message with backticks or `$` in it is a **program**: `git commit -m "…"` lets the shell run it
   before git sees it. Every message here goes through `git commit -F - <<'MSG'` with a quoted delimiter.
 * A `git merge` inside an `&&` chain can print success and change nothing. Merge in its own call, then prove
   it: `git rev-parse --short main` and `git merge-base --is-ancestor <branch> main`. Never trust an echo.
+* Textual I/O names its encoding. `open(...)`/`read_text()`/`write_text()` without `encoding=` is a bug in
+  this repo even when the code is Linux-only, because CI is not: Windows' cp1252 default cannot read
+  `server.py`'s em-dashes (F42). `tools/check_docs.py` enforces it with an `ast` walk, so it needs no memory.
 
 ## What a green gate does NOT prove — say this out loud, do not paper over it
 
